@@ -1,0 +1,23 @@
+Synapedge
+Copyright 2026 reuna-ai
+
+This product includes software developed as part of the Synapedge project.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+This project generates code that links against Espressif's esp-nn SIMD kernels.
+Those kernel sources are distributed under their own license by Espressif and
+are NOT included in this repository. Obtain them from Espressif and comply with
+their license terms.
+
+The compiler was validated against the ONNX and onnxruntime projects, and using
+the YOLOv5 and YOLO26 model architectures. Those projects and models are subject
+to their own respective licenses; refer to their upstream repositories.

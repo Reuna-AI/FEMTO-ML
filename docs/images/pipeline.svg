@@ -1,0 +1,65 @@
+<svg viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, -apple-system, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect width="900" height="300" fill="#f8fafc"/>
+  <text x="450" y="34" text-anchor="middle" font-size="20" font-weight="700" fill="#0f172a">Synapedge Compiler Pipeline (ONNX &#8594; C)</text>
+
+  <!-- stages -->
+  <g>
+    <rect x="20"  y="80" width="120" height="70" rx="8" fill="#dbeafe" stroke="#3b82f6" stroke-width="2"/>
+    <text x="80" y="108" text-anchor="middle" font-size="14" font-weight="700" fill="#1e3a8a">build</text>
+    <text x="80" y="128" text-anchor="middle" font-size="11" fill="#334155">graph_json.py</text>
+    <text x="80" y="142" text-anchor="middle" font-size="10" fill="#64748b">ONNX &#8594; JSON IR</text>
+  </g>
+  <g>
+    <rect x="165" y="80" width="120" height="70" rx="8" fill="#dbeafe" stroke="#3b82f6" stroke-width="2"/>
+    <text x="225" y="108" text-anchor="middle" font-size="14" font-weight="700" fill="#1e3a8a">nhwc</text>
+    <text x="225" y="128" text-anchor="middle" font-size="11" fill="#334155">graph_json.py</text>
+    <text x="225" y="142" text-anchor="middle" font-size="10" fill="#64748b">NCHW &#8594; NHWC</text>
+  </g>
+  <g>
+    <rect x="310" y="80" width="120" height="70" rx="8" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
+    <text x="370" y="108" text-anchor="middle" font-size="14" font-weight="700" fill="#92400e">fuse</text>
+    <text x="370" y="128" text-anchor="middle" font-size="11" fill="#334155">fuse.py</text>
+    <text x="370" y="142" text-anchor="middle" font-size="10" fill="#64748b">SiLU, Q/DQ</text>
+  </g>
+  <g>
+    <rect x="455" y="80" width="130" height="70" rx="8" fill="#dcfce7" stroke="#22c55e" stroke-width="2"/>
+    <text x="520" y="104" text-anchor="middle" font-size="14" font-weight="700" fill="#166534">gen_weights</text>
+    <text x="520" y="124" text-anchor="middle" font-size="11" fill="#334155">gen_weights.py</text>
+    <text x="520" y="138" text-anchor="middle" font-size="10" fill="#64748b">OHWI / depthwise</text>
+  </g>
+  <g>
+    <rect x="610" y="80" width="130" height="70" rx="8" fill="#dcfce7" stroke="#22c55e" stroke-width="2"/>
+    <text x="675" y="104" text-anchor="middle" font-size="13" font-weight="700" fill="#166534">gen_activations</text>
+    <text x="675" y="124" text-anchor="middle" font-size="11" fill="#334155">gen_activations.py</text>
+    <text x="675" y="138" text-anchor="middle" font-size="10" fill="#64748b">arena coloring</text>
+  </g>
+  <g>
+    <rect x="765" y="80" width="115" height="70" rx="8" fill="#ede9fe" stroke="#8b5cf6" stroke-width="2"/>
+    <text x="822" y="108" text-anchor="middle" font-size="14" font-weight="700" fill="#5b21b6">codegen</text>
+    <text x="822" y="128" text-anchor="middle" font-size="11" fill="#334155">codegen.py</text>
+    <text x="822" y="142" text-anchor="middle" font-size="10" fill="#64748b">emit C</text>
+  </g>
+
+  <!-- arrows -->
+  <line x1="140" y1="115" x2="163" y2="115" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="285" y1="115" x2="308" y2="115" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="430" y1="115" x2="453" y2="115" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="585" y1="115" x2="608" y2="115" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="740" y1="115" x2="763" y2="115" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- emitters box -->
+  <rect x="310" y="195" width="570" height="80" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="595" y="216" text-anchor="middle" font-size="12" font-weight="700" fill="#334155">emitters/ (per-op C generators, dispatched by codegen)</text>
+  <text x="595" y="238" text-anchor="middle" font-size="11" fill="#475569">op_conv.py &#8226; op_silu.py &#8226; op_float_ops.py &#8226; common.py</text>
+  <text x="595" y="258" text-anchor="middle" font-size="10" fill="#64748b">conv / depthwise / requant &#8226; SiLU LUT &#8226; Add/Mul/Concat/Softmax/MatMul (dequant-aware)</text>
+  <line x1="822" y1="150" x2="700" y2="193" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="3 2" marker-end="url(#arrow)"/>
+
+  <!-- input/output labels -->
+  <text x="80" y="185" text-anchor="middle" font-size="10" fill="#94a3b8" font-style="italic">yolo26n_q.onnx</text>
+  <text x="822" y="175" text-anchor="middle" font-size="10" fill="#94a3b8" font-style="italic">model.c/.h</text>
+</svg>

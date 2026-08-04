@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Generated compiler artifacts (should not be committed)
+graph.json
+graph_fused.json
+model.c
+model.cpp
+model.h
+activations.c
+activations.cpp
+activations.h
+weights*.c
+weights*.h
+*.bin
+
+# Device capture / debug dumps
+dump_*.txt
+*_COMPARISON*.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Build outputs
+build/
+dist/
+*.elf
+*.map

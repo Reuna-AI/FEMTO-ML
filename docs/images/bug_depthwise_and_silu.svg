@@ -1,0 +1,87 @@
+<svg viewBox="0 0 880 470" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, -apple-system, sans-serif">
+  <defs>
+    <marker id="a2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#475569"/></marker>
+  </defs>
+  <rect width="880" height="470" fill="#f8fafc"/>
+
+  <!-- TOP: depthwise transpose -->
+  <text x="440" y="30" text-anchor="middle" font-size="16" font-weight="700" fill="#0f172a">Bug #1 — Depthwise kernel transposed (kh &#8596; kw)</text>
+
+  <text x="180" y="60" text-anchor="middle" font-size="12" font-weight="700" fill="#dc2626">generic OHWI transpose (wrong for depthwise)</text>
+  <!-- 3x3 kernel original -->
+  <g transform="translate(90,75)">
+    <text x="45" y="-4" text-anchor="middle" font-size="10" fill="#334155">stored [K,Kh,Kw]</text>
+    <rect x="0" y="0" width="30" height="30" fill="#dbeafe" stroke="#3b82f6"/><text x="15" y="20" text-anchor="middle" font-size="11">0</text>
+    <rect x="30" y="0" width="30" height="30" fill="#dbeafe" stroke="#3b82f6"/><text x="45" y="20" text-anchor="middle" font-size="11">1</text>
+    <rect x="60" y="0" width="30" height="30" fill="#dbeafe" stroke="#3b82f6"/><text x="75" y="20" text-anchor="middle" font-size="11">2</text>
+    <rect x="0" y="30" width="30" height="30" fill="#dbeafe" stroke="#3b82f6"/><text x="15" y="50" text-anchor="middle" font-size="11">3</text>
+    <rect x="30" y="30" width="30" height="30" fill="#dbeafe" stroke="#3b82f6"/><text x="45" y="50" text-anchor="middle" font-size="11">4</text>
+    <rect x="60" y="30" width="30" height="30" fill="#dbeafe" stroke="#3b82f6"/><text x="75" y="50" text-anchor="middle" font-size="11">5</text>
+    <rect x="0" y="60" width="30" height="30" fill="#dbeafe" stroke="#3b82f6"/><text x="15" y="80" text-anchor="middle" font-size="11">6</text>
+    <rect x="30" y="60" width="30" height="30" fill="#dbeafe" stroke="#3b82f6"/><text x="45" y="80" text-anchor="middle" font-size="11">7</text>
+    <rect x="60" y="60" width="30" height="30" fill="#dbeafe" stroke="#3b82f6"/><text x="75" y="80" text-anchor="middle" font-size="11">8</text>
+  </g>
+  <text x="205" y="120" font-size="20" fill="#dc2626">&#8594;</text>
+  <g transform="translate(240,75)">
+    <text x="45" y="-4" text-anchor="middle" font-size="10" fill="#dc2626">after OHWI: transposed!</text>
+    <rect x="0" y="0" width="30" height="30" fill="#fee2e2" stroke="#dc2626"/><text x="15" y="20" text-anchor="middle" font-size="11">0</text>
+    <rect x="30" y="0" width="30" height="30" fill="#fee2e2" stroke="#dc2626"/><text x="45" y="20" text-anchor="middle" font-size="11">3</text>
+    <rect x="60" y="0" width="30" height="30" fill="#fee2e2" stroke="#dc2626"/><text x="75" y="20" text-anchor="middle" font-size="11">6</text>
+    <rect x="0" y="30" width="30" height="30" fill="#fee2e2" stroke="#dc2626"/><text x="15" y="50" text-anchor="middle" font-size="11">1</text>
+    <rect x="30" y="30" width="30" height="30" fill="#fee2e2" stroke="#dc2626"/><text x="45" y="50" text-anchor="middle" font-size="11">4</text>
+    <rect x="60" y="30" width="30" height="30" fill="#fee2e2" stroke="#dc2626"/><text x="75" y="50" text-anchor="middle" font-size="11">7</text>
+    <rect x="0" y="60" width="30" height="30" fill="#fee2e2" stroke="#dc2626"/><text x="15" y="80" text-anchor="middle" font-size="11">2</text>
+    <rect x="30" y="60" width="30" height="30" fill="#fee2e2" stroke="#dc2626"/><text x="45" y="80" text-anchor="middle" font-size="11">5</text>
+    <rect x="60" y="60" width="30" height="30" fill="#fee2e2" stroke="#dc2626"/><text x="75" y="80" text-anchor="middle" font-size="11">8</text>
+  </g>
+  <text x="400" y="120" font-size="20" fill="#16a34a">&#8594;</text>
+  <g transform="translate(430,75)">
+    <text x="45" y="-4" text-anchor="middle" font-size="10" fill="#16a34a">fix: repack [Kh,Kw,K]</text>
+    <rect x="0" y="0" width="30" height="30" fill="#dcfce7" stroke="#16a34a"/><text x="15" y="20" text-anchor="middle" font-size="11">0</text>
+    <rect x="30" y="0" width="30" height="30" fill="#dcfce7" stroke="#16a34a"/><text x="45" y="20" text-anchor="middle" font-size="11">1</text>
+    <rect x="60" y="0" width="30" height="30" fill="#dcfce7" stroke="#16a34a"/><text x="75" y="20" text-anchor="middle" font-size="11">2</text>
+    <rect x="0" y="30" width="30" height="30" fill="#dcfce7" stroke="#16a34a"/><text x="15" y="50" text-anchor="middle" font-size="11">3</text>
+    <rect x="30" y="30" width="30" height="30" fill="#dcfce7" stroke="#16a34a"/><text x="45" y="50" text-anchor="middle" font-size="11">4</text>
+    <rect x="60" y="30" width="30" height="30" fill="#dcfce7" stroke="#16a34a"/><text x="75" y="50" text-anchor="middle" font-size="11">5</text>
+    <rect x="0" y="60" width="30" height="30" fill="#dcfce7" stroke="#16a34a"/><text x="15" y="80" text-anchor="middle" font-size="11">6</text>
+    <rect x="30" y="60" width="30" height="30" fill="#dcfce7" stroke="#16a34a"/><text x="45" y="80" text-anchor="middle" font-size="11">7</text>
+    <rect x="60" y="60" width="30" height="30" fill="#dcfce7" stroke="#16a34a"/><text x="75" y="80" text-anchor="middle" font-size="11">8</text>
+  </g>
+  <text x="620" y="110" font-size="11" fill="#334155">Correct layout for both the</text>
+  <text x="620" y="126" font-size="11" fill="#334155">scalar kernel and the esp-nn</text>
+  <text x="620" y="142" font-size="11" fill="#334155">depthwise SIMD library.</text>
+
+  <line x1="40" y1="195" x2="840" y2="195" stroke="#cbd5e1" stroke-width="1.5"/>
+
+  <!-- BOTTOM: SiLU fusion -->
+  <text x="440" y="225" text-anchor="middle" font-size="16" font-weight="700" fill="#0f172a">SiLU + Quantize Fusion (FUSE_SILU_QUANTIZE)</text>
+
+  <!-- unfused (False) -->
+  <text x="230" y="255" text-anchor="middle" font-size="13" font-weight="700" fill="#0284c7">FALSE (shipped, working)</text>
+  <g font-size="10">
+    <rect x="70" y="270" width="90" height="36" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="115" y="292" text-anchor="middle" fill="#3730a3">conv (int8)</text>
+    <rect x="70" y="320" width="90" height="36" rx="5" fill="#e0f2fe" stroke="#0284c7"/><text x="115" y="342" text-anchor="middle" fill="#075985">SiLU (float)</text>
+    <rect x="70" y="370" width="90" height="36" rx="5" fill="#fef3c7" stroke="#f59e0b"/><text x="115" y="392" text-anchor="middle" fill="#92400e">Quantize</text>
+    <rect x="70" y="420" width="90" height="34" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="115" y="441" text-anchor="middle" fill="#3730a3">next conv</text>
+  </g>
+  <line x1="115" y1="306" x2="115" y2="319" stroke="#475569" stroke-width="1.5" marker-end="url(#a2)"/>
+  <line x1="115" y1="356" x2="115" y2="369" stroke="#475569" stroke-width="1.5" marker-end="url(#a2)"/>
+  <line x1="115" y1="406" x2="115" y2="419" stroke="#475569" stroke-width="1.5" marker-end="url(#a2)"/>
+  <text x="230" y="345" font-size="10" fill="#64748b">SiLU dequantizes via</text>
+  <text x="230" y="360" font-size="10" fill="#64748b">LUT, outputs float;</text>
+  <text x="230" y="375" font-size="10" fill="#64748b">separate Q re-quantizes.</text>
+
+  <!-- fused (True) -->
+  <text x="610" y="255" text-anchor="middle" font-size="13" font-weight="700" fill="#16a34a">TRUE (proven identical, ~1% faster)</text>
+  <g font-size="10">
+    <rect x="470" y="270" width="90" height="36" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="515" y="292" text-anchor="middle" fill="#3730a3">conv (int8)</text>
+    <rect x="470" y="330" width="90" height="46" rx="5" fill="#dcfce7" stroke="#16a34a"/><text x="515" y="350" text-anchor="middle" fill="#166534">SiLU (int8)</text><text x="515" y="365" text-anchor="middle" font-size="9" fill="#14532d">quant in LUT</text>
+    <rect x="470" y="410" width="90" height="34" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="515" y="431" text-anchor="middle" fill="#3730a3">next conv</text>
+  </g>
+  <line x1="515" y1="306" x2="515" y2="329" stroke="#475569" stroke-width="1.5" marker-end="url(#a2)"/>
+  <line x1="515" y1="376" x2="515" y2="409" stroke="#475569" stroke-width="1.5" marker-end="url(#a2)"/>
+  <text x="640" y="345" font-size="10" fill="#64748b">Quantize folded into the</text>
+  <text x="640" y="360" font-size="10" fill="#64748b">256-entry int8 LUT.</text>
+  <text x="640" y="375" font-size="10" fill="#64748b">Q node removed &#8594; one</text>
+  <text x="640" y="390" font-size="10" fill="#64748b">fewer tensor pass.</text>
+</svg>

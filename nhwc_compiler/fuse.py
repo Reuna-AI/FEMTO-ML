@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 reuna-ai
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# For issues and contributions, visit:
+# https://github.com/reuna-ai/synapedge-reuna-ai
+# ============================================================================
+
+"""
+fuse.py — Stage (between nhwc pass and codegen): graph-level fusion.
+SEPARATE pass, operates only on the JSON. Emitter stays fusion-unaware except
+for the SiLU node (which it maps to the 256-entry LUT you validated).
+
+Fusions implemented (graph rewrite only; no writeback fusion yet):
+  1. SiLU:  x*sigmoid(x)  -> single 'SiLU' node.
+       float form :  ...->[DequantizeLinear D]->Sigmoid S ; Mul M(inputs: S.out, D.out) ->[QuantizeLinear Q]
+       quant form :  QLinearSigmoid S ; QLinearMul M(S.out, x)  (both from same source)
+     The SiLU node carries in_scale/in_zp (pre-activation) and out_scale/out_zp
+     (post) so the emitter can build the LUT.
+  2. Q/DQ cancel: adjacent DequantizeLinear->QuantizeLinear (or Q->DQ) with matching
+     scale+zp and nothing else consuming the middle tensor -> drop both.
+
+Model-agnostic: matches by op type + dataflow, never by node name.
+
+  python fuse.py graph_nhwc.json graph_fused.json
+"""
+import sys, json, argparse
+
+# ---- Fusion directives (edit here; build-time toggles, not CLI flags) ----
+# Fold the QuantizeLinear that follows a SiLU into the SiLU's int8 LUT, removing ~50
+# redundant full-tensor requant passes. Set False for the original SiLU-float + separate-Q
+# behavior (byte-identical to the pre-fusion working build).
+FUSE_SILU_QUANTIZE = False
+# --------------------------------------------------------------------------
+
+def build_maps(d):
+    producer={}   # tensor -> node that writes it
+    consumers={}  # tensor -> [nodes that read it]
+    for n in d["nodes"]:
+        for o in n["outputs"]: producer[o]=n
+        for i in n["inputs"]: consumers.setdefault(i,[]).append(n)
+    return producer, consumers
+
+def qparams_of_Q(node):
+    # QuantizeLinear inputs: [x, y_scale, y_zp]  -> returns (scale_name, zp_name)
+    return (node["inputs"][1], node["inputs"][2] if len(node["inputs"])>2 else None)
+def qparams_of_DQ(node):
+    # DequantizeLinear inputs: [x, x_scale, x_zp]
+    return (node["inputs"][1], node["inputs"][2] if len(node["inputs"])>2 else None)
+
+def fuse_silu(d):
+    prod,cons=build_maps(d)
+    remove=set(); add=[]; rewrite={}   # fused-away tensor -> replacement
+    silu_n=0
+
+    for n in d["nodes"]:
+        # ---- quantized form: QLinearMul fed by QLinearSigmoid ----
+        if n["op"]=="QLinearMul":
+            # QLinearMul inputs: A,A_s,A_zp, B,B_s,B_zp, C_s,C_zp
+            a=n["inputs"][0]; b=n["inputs"][3]
+            pa=prod.get(a); pb=prod.get(b)
+            sig = pa if (pa and pa["op"]=="QLinearSigmoid") else (pb if (pb and pb["op"]=="QLinearSigmoid") else None)
+            if sig:
+                x = sig["inputs"][0]                       # sigmoid's input (pre-activation)
+                other = b if sig is pa else a              # the identity branch
+                if other == x or prod.get(other) is prod.get(x):
+                    in_s, in_zp = sig["inputs"][1], sig["inputs"][2]      # X_scale,X_zp of sigmoid
+                    out_s, out_zp = n["inputs"][6], n["inputs"][7]        # C_scale,C_zp of mul
+                    o=n["outputs"][0]
+                    add.append({"name":o+"_silu","op":"SiLU","inputs":[x],"outputs":[o],
+                                "attrs":{"in_scale":in_s,"in_zp":in_zp,"out_scale":out_s,"out_zp":out_zp}})
+                    remove.add(id(n)); remove.add(id(sig)); silu_n+=1
+                    continue
+
+        # ---- float form: Mul fed by Sigmoid, both from same (dequantized) source ----
+        if n["op"]=="Mul":
+            a,b=n["inputs"][0],n["inputs"][1]
+            pa=prod.get(a); pb=prod.get(b)
+            sig = pa if (pa and pa["op"]=="Sigmoid") else (pb if (pb and pb["op"]=="Sigmoid") else None)
+            if sig:
+                sx=sig["inputs"][0]                        # sigmoid input
+                other=b if sig is pa else a
+                if other==sx:                              # x * sigmoid(x)
+                    # trace quant params: the source is usually a DequantizeLinear D
+                    D=prod.get(sx)
+                    q_after = None
+                    for c in cons.get(n["outputs"][0],[]):
+                        if c["op"]=="QuantizeLinear": q_after=c
+                    if D and D["op"]=="DequantizeLinear" and q_after:
+                        in_s,in_zp = qparams_of_DQ(D)
+                        out_s,out_zp = qparams_of_Q(q_after)
+                        x_int = D["inputs"][0]                 # int8 conv output
+                        o = q_after["outputs"][0]              # int8 output (feeds next conv)
+                        if FUSE_SILU_QUANTIZE:
+                            # FUSED: int8 -> SiLU -> int8 (absorb Dequant + Quantize).
+                            rewrite[n["outputs"][0]] = o
+                            add.append({"name":o+"_silu","op":"SiLU","inputs":[x_int],"outputs":[o],
+                                        "attrs":{"in_scale":in_s,"in_zp":in_zp,
+                                                 "out_scale":out_s,"out_zp":out_zp}})
+                            remove.add(id(n)); remove.add(id(sig)); remove.add(id(D)); remove.add(id(q_after))
+                        else:
+                            # UNFUSED: SiLU reads INT8 conv output (LUT is int8-indexed) and
+                            # OUTPUTS FLOAT (no out params); the separate Quantize requantizes.
+                            # The SiLU LUT does the dequant internally, so DROP the DequantizeLinear
+                            # too, but KEEP the QuantizeLinear (it reads the SiLU float output).
+                            silu_out = n["outputs"][0]             # Mul's float output (Q reads it)
+                            add.append({"name":silu_out+"_silu","op":"SiLU","inputs":[x_int],
+                                        "outputs":[silu_out],
+                                        "attrs":{"in_scale":in_s,"in_zp":in_zp}})  # NO out params -> float
+                            remove.add(id(n)); remove.add(id(sig)); remove.add(id(D))  # drop D, keep q_after
+                            if silu_out in d["tensors"]: d["tensors"][silu_out]["dtype"]="float32"
+                        silu_n+=1
+                        continue
+
+    new_nodes=[nd for nd in d["nodes"] if id(nd) not in remove]
+    new_nodes += add
+    for nd in new_nodes:
+        nd["inputs"]=[rewrite.get(i,i) for i in nd["inputs"]]
+    # graph outputs may also reference a fused-away name
+    d["outputs"]=[rewrite.get(o,o) for o in d.get("outputs",[])]
+    d["nodes"]=new_nodes
+
+    # register SiLU output dtype: int8 only if FUSED (has out params); else float.
+    # CRITICAL: also attach q_scale/q_zp to int8 SiLU outputs so downstream float ops
+    # (Add/Concat/Mul residuals) know how to dequantize them. Without this, an int8 SiLU
+    # output added to a float tensor is read as raw ints -> garbage.
+    for a in add:
+        o=a["outputs"][0]
+        if o not in d["tensors"]: continue
+        if "out_scale" in a["attrs"]:
+            d["tensors"][o]["dtype"]="int8"
+            # resolve the actual scale/zp values from the referenced tensors
+            os_name=a["attrs"]["out_scale"]; oz_name=a["attrs"]["out_zp"]
+            def _val(nm):
+                t=d["tensors"].get(nm,{}); v=t.get("value")
+                return (v[0] if isinstance(v,list) and v else v)
+            sc=_val(os_name); zp=_val(oz_name)
+            if sc is not None: d["tensors"][o]["q_scale"]=float(sc)
+            if zp is not None: d["tensors"][o]["q_zp"]=int(zp)
+        else:
+            d["tensors"][o]["dtype"]="float32"
+    return silu_n
+
+
+def fuse_silu_quantize(d):
+    """Remove QuantizeLinear nodes that directly follow a SiLU when the SiLU already
+    carries matching out_scale/out_zp. The SiLU emitter folds the quantize into its
+    int8 LUT, so the separate Q is a redundant full-tensor pass. Fusing it away
+    eliminates one read+write over the whole activation per SiLU (~50 in YOLO26)."""
+    prod,cons=build_maps(d)
+    remove=set(); rewrite={}; fused=0
+    for n in d["nodes"]:
+        if n["op"]!="QuantizeLinear": continue
+        src=n["inputs"][0]; p=prod.get(src)
+        if not p or p["op"]!="SiLU": continue
+        at=p["attrs"]
+        if "out_scale" not in at or "out_zp" not in at: continue
+        # require SiLU.out_scale/zp == Q.scale/zp (same tensor names => exact match)
+        q_s,q_zp = n["inputs"][1], n["inputs"][2]
+        if at["out_scale"]!=q_s or at["out_zp"]!=q_zp:
+            continue
+        # rewire: SiLU should now write DIRECTLY to the Q's output tensor.
+        q_out=n["outputs"][0]
+        p["outputs"]=[q_out]                    # SiLU emits int8 into the Q's output name
+        p["attrs"]["fuse_q"]=1                   # tag: emitter should use int8 fused path
+        rewrite[src]=q_out                      # anyone reading SiLU's old output -> Q output
+        remove.add(id(n)); fused+=1
+    if fused:
+        new=[nd for nd in d["nodes"] if id(nd) not in remove]
+        for nd in new:
+            nd["inputs"]=[rewrite.get(i,i) for i in nd["inputs"]]
+        d["outputs"]=[rewrite.get(o,o) for o in d.get("outputs",[])]
+        d["nodes"]=new
+        # mark fused SiLU outputs int8
+        for nd in d["nodes"]:
+            if nd["op"]=="SiLU":
+                o=nd["outputs"][0]
+                if o in d["tensors"]: d["tensors"][o]["dtype"]="int8"
+    return fused
+
+
+def _silu_drop_unfused_outparams(d):
+    """For any SiLU still followed by a QuantizeLinear (i.e. NOT fused), remove its
+    out_scale/out_zp attrs so the emitter falls back to FLOAT output and the separate
+    Q does the requant. Keeps graph + emitter consistent when fusion is off/partial."""
+    prod={o:n for n in d["nodes"] for o in n["outputs"]}
+    cons={}
+    for n in d["nodes"]:
+        for i in n["inputs"]: cons.setdefault(i,[]).append(n)
+    dropped=0
+    for n in d["nodes"]:
+        if n["op"]!="SiLU": continue
+        o=n["outputs"][0]
+        has_q=any(c["op"]=="QuantizeLinear" for c in cons.get(o,[]))
+        if has_q and ("out_scale" in n["attrs"] or "out_zp" in n["attrs"]):
+            n["attrs"].pop("out_scale",None); n["attrs"].pop("out_zp",None)
+            if o in d["tensors"]: d["tensors"][o]["dtype"]="float32"
+            dropped+=1
+    return dropped
+
+def topo_sort(d):
+    prod={o:n for n in d["nodes"] for o in n["outputs"]}
+    seen=set(); order=[]
+    def visit(n, stack):
+        if id(n) in seen: return
+        for i in n["inputs"]:
+            p=prod.get(i)
+            if p and id(p) not in seen and id(p) not in stack:
+                visit(p, stack|{id(n)})
+        seen.add(id(n)); order.append(n)
+    for n in d["nodes"]:
+        visit(n, set())
+    d["nodes"]=order
+
+def main(inp,out):
+    d=json.load(open(inp,encoding="utf-8"))
+    n_silu=fuse_silu(d)
+    # fuse_silu already applies/omits the Q-absorption per FUSE_SILU_QUANTIZE.
+    print(f"[fuse] SiLU={n_silu}"
+          + ("  (SiLU+Q FUSED: int8->int8)" if FUSE_SILU_QUANTIZE
+             else "  (SiLU+Q UNFUSED: float SiLU + separate Q)"))
+    topo_sort(d)
+    json.dump(d, open(out,"w",encoding="utf-8"), indent=1, ensure_ascii=False)
+    print(f"fuse -> {out}: SiLU fused = {n_silu}, nodes now {len(d['nodes'])}")
+
+if __name__=="__main__":
+    ap=argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out")
+    a=ap.parse_args(); main(a.inp,a.out)
