@@ -1,5 +1,6 @@
-# <img width="259" height="259" alt="FEMTO (6)" src="https://github.com/user-attachments/assets/cccd050b-c194-458c-9b7d-d9bd4c9bdc05" />
-
+<p align="center">
+  <img width="259" height="46" alt="FEMTO (6)" src="https://github.com/user-attachments/assets/4768b9bc-8d74-49cf-8ccf-d1ecb7037eeb" />
+</p>
 **A model-agnostic ONNX → C compiler for quantized int8 neural networks on microcontrollers.**
 
 Synapedge turns a quantized int8 ONNX model into portable, standalone C that runs on
