@@ -1,4 +1,4 @@
-# Synapedge — ONNX → C Compiler Documentation
+# FEMTO-ML — ONNX → C Compiler Documentation
 
 A model-agnostic compiler that turns quantized int8 ONNX models (CNNs *and* transformer‑attention detectors) into standalone C that runs on the ESP32‑S3 (NHWC layout, esp‑nn SIMD). Validated on **YOLOv5n** and **YOLO26n**, producing correct on‑device detections verified node‑by‑node against onnxruntime.
 
