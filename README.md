@@ -177,7 +177,7 @@ regeneration from ONNX:
 
 ## Validation
 
-Synapedge's correctness contract is **node-by-node agreement with onnxruntime**. Three tools
+FEMTO-ML's correctness contract is **node-by-node agreement with onnxruntime**. Three tools
 support this:
 
 **Device vs onnxruntime** — capture the device's per-node dump over serial and diff it against
@@ -235,7 +235,7 @@ model re-export rather than a compiler change. See [`docs/`](docs/) for the full
 
 ## Documentation
 
-- [`docs/SYNAPEDGE_DOCUMENTATION.md`](docs/SYNAPEDGE_DOCUMENTATION.md) — architecture,
+- [`docs/SYNAPEDGE_DOCUMENTATION.md`](docs/FEMTO-ML_DOCUMENTATION.md) — architecture,
   file-by-file reference, and detailed write-ups of the correctness bugs found and fixed
   (with diagrams).
 
