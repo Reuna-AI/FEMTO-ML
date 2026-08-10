@@ -3,7 +3,7 @@
 </p>
 **A model-agnostic ONNX → C compiler for quantized int8 neural networks on microcontrollers.**
 
-Synapedge turns a quantized int8 ONNX model into portable, standalone C that runs on
+FEMTO-ML turns a quantized int8 ONNX model into portable, standalone C that runs on
 resource-constrained microcontrollers. It is model-agnostic — operators are handled as
 first-class emitters rather than hard-coded model graphs — and target-agnostic: the same
 model compiles to portable scalar C for any MCU, or to a hardware-accelerated backend where
@@ -38,8 +38,8 @@ onnxruntime.
 
 ## Targets and portability
 
-Synapedge is designed to run models on **any microcontroller**. The compiler always produces
-portable C; where a target exposes SIMD or a vendor kernel library, Synapedge can route the
+FEMTO-ML is designed to run models on **any microcontroller**. The compiler always produces
+portable C; where a target exposes SIMD or a vendor kernel library, FEMTO-ML can route the
 heavy operators (convolutions) to it, falling back to scalar C everywhere else.
 
 `--target` selects the code path for the compute-heavy operators:
@@ -113,8 +113,8 @@ work-in-progress, not a finished backend.
 
 ### Install
 ```bash
-git clone https://github.com/reuna-ai/synapedge.git
-cd synapedge
+git clone https://github.com/reuna-ai/FEMTO-ML.git
+cd FEMTO-ML
 pip install -r requirements.txt
 ```
 
