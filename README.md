@@ -1,7 +1,7 @@
 <p align="center">
   <img width="259" height="46" alt="FEMTO (6)" src="https://github.com/user-attachments/assets/4768b9bc-8d74-49cf-8ccf-d1ecb7037eeb" />
 </p>
-**A model-agnostic ONNX → C compiler for quantized int8 neural networks on microcontrollers.**
+A model-agnostic ONNX → C compiler for quantized int8 neural networks on microcontrollers.
 
 FEMTO-ML turns a quantized int8 ONNX model into portable, standalone C that runs on
 resource-constrained microcontrollers. It is model-agnostic — operators are handled as
