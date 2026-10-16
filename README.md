@@ -1,5 +1,6 @@
+
 <p align="center">
-  <img width="259" height="46" alt="FEMTO (6)" src="https://github.com/user-attachments/assets/4768b9bc-8d74-49cf-8ccf-d1ecb7037eeb" />
+  <img width="518" height="207" alt="FEMTO_01" src="https://github.com/user-attachments/assets/0b7713e3-c92e-4a48-bbed-b71f5f35d27d" />
 </p>
 A model-agnostic ONNX → C compiler for quantized int8 neural networks on microcontrollers.
 
