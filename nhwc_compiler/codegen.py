@@ -31,7 +31,7 @@ import sys, os, json, argparse, importlib, pkgutil
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import emitters
 from emitters import REGISTRY
-from emitters.common import EmitCtx, san, wsan
+from emitters.common import EmitCtx, san, wsan, cfloat, quant_c
 
 def load_all():
     for _,name,_ in pkgutil.iter_modules(emitters.__path__):
@@ -61,6 +61,19 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
         else: skipped[n["op"]]=skipped.get(n["op"],0)+1
 
     base=out_base.split("/")[-1].split("\\")[-1]
+
+    # A model that quantizes its float NCHW input and transposes it to NHWC before
+    # anything else: the caller can write that int8 NHWC tensor itself (one byte a
+    # value, not four, straight from its camera's pixels) and skip both.
+    skip_input=None
+    if len(ctx.calls)>=2:
+        q=ctx.calls[0][0]; t=ctx.calls[1][0]
+        if (q["op"]=="QuantizeLinear" and d.get("inputs") and q["inputs"][0]==d["inputs"][0]
+                and t["op"]=="Transpose" and t["inputs"][0]==q["outputs"][0]
+                and t["attrs"].get("perm")==[0,2,3,1] and len(ctx.shape(t["outputs"][0]))==4
+                and ctx.val0(q["inputs"][1]) is not None):
+            zq=ctx.val0(q["inputs"][2]) if len(q["inputs"])>2 else 0
+            skip_input=(t["outputs"][0], float(ctx.val0(q["inputs"][1])), int(zq or 0))
     # ---- header ----
     with open(out_base+".h","w",encoding="utf-8") as h:
         h.write("// Auto-generated model header. Do not edit.\n#pragma once\n")
@@ -91,6 +104,20 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
         h.write("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
         for line in ctx.header: h.write(line+"\n")
         h.write("\nvoid run_model(void);\n")
+        if skip_input:
+            name, sc, zp = skip_input
+            _,H,W,C = ctx.shape(name)
+            h.write("\n/* The input as the first conv reads it: int8, [H][W][C], quantized as below.\n")
+            h.write(" * Fill it (model_quantize_input() is the model's own QuantizeLinear) and call\n")
+            h.write(" * run_model_int8_input() in place of filling the float input and run_model(). */\n")
+            h.write("#define MODEL_INPUT_INT8 1\n")
+            h.write(f"#define MODEL_INPUT_H {H}\n#define MODEL_INPUT_W {W}\n#define MODEL_INPUT_C {C}\n")
+            h.write(f"#define MODEL_INPUT_SCALE {cfloat(sc)}\n#define MODEL_INPUT_ZP {zp}\n")
+            h.write(f"#define model_input_int8 ((int8_t*){san(name)})\n")
+            h.write("static inline int8_t model_quantize_input(float x) {\n")
+            h.write("  const float inv=1.0f/MODEL_INPUT_SCALE; const int z=MODEL_INPUT_ZP; int8_t y;\n")
+            h.write("  " + quant_c("y", "x") + "\n  return y;\n}\n")
+            h.write("void run_model_int8_input(void);\n")
         h.write("\n#ifdef __cplusplus\n}\n#endif\n")
 
     # ---- body + driver ----
@@ -148,7 +175,7 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
         c.write("#define DUMP_I8(nm,p,H,W,C,sc,zp,nchw) dump_i8(nm,(const signed char*)(p),H,W,C,sc,zp,nchw)\n")
         c.write("#define DUMP_F(nm,p,H,W,C,nchw) dump_f(nm,(const float*)(p),H,W,C,nchw)\n")
         c.write("#else\n#define DUMP_I8(nm,p,H,W,C,sc,zp,nchw)\n#define DUMP_F(nm,p,H,W,C,nchw)\n#define DUMP_FLAT_I8(nm,p,C,per,sc,zp)\n#define DUMP_FLAT_F(nm,p,C,per)\n#endif\n\n")
-        c.write("void run_model(void){\n")
+        c.write("static void run_from(int first){\n  (void)first;\n")
         def dump_call(node):
             outs=node["outputs"]
             if not outs: return ""
@@ -201,6 +228,10 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
                 return f'  DUMP_FLAT_I8("{node["name"]}", {ref}, {C},{per}, {sc},{zp});\n'
         for _idx,rec in enumerate(ctx.calls):
             node=rec[0]; fn=rec[1]
+            if skip_input and _idx in (1, 2):
+                c.write("  }\n")
+            if skip_input and _idx<2:
+                c.write(f"  if(first<={_idx}){{\n")
             c.write(f'  DBG_NODE({_idx}, "{node["op"]}", "{node["name"]}");\n')
             ins=node["inputs"]; outs=node["outputs"]
             if node["op"]=="QLinearConv":
@@ -208,7 +239,7 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
                 bias=(f"(const int32_t*){wsan(ins[8])}") if len(ins)>8 else "0"
                 y=buf_ref(ctx,outs[0])
                 c.write(f'  TRACE("{node["name"]}");\n  {fn}({x}, {w}, {bias}, {y});\n'); c.write(dump_call(node))
-            elif node["op"]=="SiLU":
+            elif node["op"]=="SiLU" and len(rec)<3:
                 c.write(f'  TRACE("{node["name"]}");\n  {fn}({buf_ref(ctx,ins[0])}, {buf_ref(ctx,outs[0])});\n'); c.write(dump_call(node))
             elif len(rec)>=3:
                 names=rec[2]
@@ -228,7 +259,10 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
                     allt=data_ins+list(outs)
                     exprs=[buf_ref(ctx,t) for t in allt][:len(names)]
                 c.write(f'  TRACE("{node["name"]}");\n  {fn}({", ".join(exprs)});\n'); c.write(dump_call(node))
-        c.write("  DBG_END();\n}\n")
+        c.write("  DBG_END();\n}\n\n")
+        c.write("void run_model(void){ run_from(0); }\n")
+        if skip_input:
+            c.write("void run_model_int8_input(void){ run_from(2); }\n")
 
     n_ok=len(d["nodes"])-sum(skipped.values())
     print(f"codegen[{target}] -> {out_base}.c/.h : {n_ok} ops emitted")

@@ -23,7 +23,17 @@ LUT[256] indexed by (uint8)(x+128); each entry = silu(in_scale*(q-128 - in_zp)).
 """
 import math
 from . import register
-from .common import cfloat, fsan, numel, quant_c
+from .common import cfloat, fsan, numel, quant_c, also_q, also_q_consts, also_q_stores
+
+def _lut_i8_loop(n):
+    """C for y[i] = lut[x[i]] over n int8s: a word of four at a time where both are
+    word-aligned (every arena tensor is), so a quarter of the loads and stores to PSRAM."""
+    return (f"  int i=0;\n"
+            f"  if(!(((uintptr_t)x|(uintptr_t)y)&3)){{ const uint32_t* xw=(const uint32_t*)x; uint32_t* yw=(uint32_t*)y;\n"
+            f"    for(;i+4<={n};i+=4){{ uint32_t v=*xw++ ^ 0x80808080u;\n"
+            f"      *yw++ = (uint32_t)(uint8_t)lut[v&255] | (uint32_t)(uint8_t)lut[(v>>8)&255]<<8\n"
+            f"            | (uint32_t)(uint8_t)lut[(v>>16)&255]<<16 | (uint32_t)(uint8_t)lut[v>>24]<<24; }} }}\n"
+            f"  for(;i<{n};++i) y[i]=lut[(unsigned char)(x[i]+128)];")
 
 @register("SiLU")
 def emit(ctx, node):
@@ -66,7 +76,7 @@ def emit(ctx, node):
         b.append(f"  static int8_t lut[256]; static int ready=0;")
         b.append(f"  if(!ready){{ const float inv=1.0f/{cfloat(os_l)}; const int z={oz_l};")
         b.append(f"    for(int q=0;q<256;++q) " + quant_c("lut[q]", "lutf[q]") + " ready=1; }")
-        b.append(f"  for(int i=0;i<{n};++i) y[i]=lut[(unsigned char)(x[i]+128)];")
+        b.append(_lut_i8_loop(n))
         b.append("}"); b.append("")
         ctx.calls.append((node, fn))
         return
@@ -86,7 +96,7 @@ def emit(ctx, node):
         b.append(f"// SiLU {node['name']}  n={n}  in=({is_:.6g},{iz}) out=({os_:.6g},{oz_})  int8->int8 (quant fused)")
         b.append(sig+" {")
         b.append(f"  static const int8_t lut[256]={{{tbl}}};")
-        b.append(f"  for(int i=0;i<{n};++i) y[i]=lut[(unsigned char)(x[i]+128)];")
+        b.append(_lut_i8_loop(n))
         b.append("}"); b.append("")
         if y in ctx.T: ctx.T[y]["dtype"]="int8"
     else:
@@ -96,12 +106,30 @@ def emit(ctx, node):
             xf=is_*((q-128)-iz)
             lutf.append(xf/(1.0+math.exp(-xf)))
         tbl=", ".join(cfloat(v) for v in lutf)
+        extra=also_q(node)
+        if extra:
+            # and the QuantizeLinears after it, in the same pass (fuse.py fold_quantize_into_producer)
+            sig=f"void {fn}(const int8_t* x, float* y" + "".join(f", int8_t* q{k}" for k in range(len(extra))) + ")"
+            h.append(sig+";")
+            b.append(f"// SiLU {node['name']}  n={n}  in=({is_:.6g},{iz})  int8->float, and int8 for {len(extra)} QuantizeLinear(s)")
+            b.append(sig+" {")
+            b.append(f"  static const float lut[256]={{{tbl}}};")
+            b.append("  " + also_q_consts(extra))
+            keep = "" if all(e.get("float_dead") for e in extra) else "y[i]=v; "
+            b.append(f"  for(int i=0;i<{n};++i){{ float v=lut[(unsigned char)(x[i]+128)]; {keep}" + also_q_stores(extra, "v", "i") + " }")
+            b.append("}"); b.append("")
+            if y in ctx.T: ctx.T[y]["dtype"]="float32"
+            ctx.calls.append((node, fn, [x, y] + [e["dst"] for e in extra]))
+            return
         sig=f"void {fn}(const int8_t* x, float* y)"
         h.append(sig+";")
         b.append(f"// SiLU {node['name']}  n={n}  in=({is_:.6g},{iz})  int8->float")
         b.append(sig+" {")
         b.append(f"  static const float lut[256]={{{tbl}}};")
-        b.append(f"  for(int i=0;i<{n};++i) y[i]=lut[(unsigned char)(x[i]+128)];")
+        b.append(f"  int i=0;")
+        b.append(f"  for(;i+4<={n};i+=4){{ y[i]=lut[(unsigned char)(x[i]+128)]; y[i+1]=lut[(unsigned char)(x[i+1]+128)];")
+        b.append(f"    y[i+2]=lut[(unsigned char)(x[i+2]+128)]; y[i+3]=lut[(unsigned char)(x[i+3]+128)]; }}")
+        b.append(f"  for(;i<{n};++i) y[i]=lut[(unsigned char)(x[i]+128)];")
         b.append("}"); b.append("")
         if y in ctx.T: ctx.T[y]["dtype"]="float32"
     ctx.calls.append((node, fn))

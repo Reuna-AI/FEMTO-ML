@@ -24,7 +24,7 @@ Everything else is pure float32. Structural ops read static attrs from JSON.
 Signatures pass explicit buffers; shapes/attrs baked as literals.
 """
 from . import register, REGISTRY
-from .common import fsan, san, wsan, numel, cfloat, quant_c
+from .common import fsan, san, wsan, numel, cfloat, quant_c, also_q, also_q_consts, also_q_stores, main_outputs
 
 def _sig(fn, args): return f"void {fn}({', '.join(args)})"
 _CDT={"int8":"int8_t","uint8":"uint8_t","int32":"int32_t","float32":"float","int64":"int64_t"}
@@ -198,11 +198,13 @@ def emit_concat(ctx,node):
     if ctx.T.get(outs,{}).get("dtype")=="int8":
         return _emit_concat_int8(ctx,node,axis)
     # output is float; inputs may be float or int8(quantized) -> dequant per input
+    extra=also_q(node)
     args=[]
     for i,inp in enumerate(ins):
         ct = "int8_t" if _isq(ctx,inp) else _ct(ctx,inp)
         args.append("const "+ct+"* in"+str(i))
     args.append("float* y")
+    args += [f"int8_t* q{k}" for k in range(len(extra))]
     sig=_sig(fn,args); ctx.header.append(sig+";")
     b=ctx.body; b.append(f"// Concat {node['name']} axis={axis} of {len(ins)} (dequant int8 inputs)")
     b.append(sig+" {")
@@ -228,8 +230,24 @@ def emit_concat(ctx,node):
     inner=1
     for dax in osh_local[axis+1:]: inner*=dax
     b.append(f"  int outer={outer}, inner={inner}, off=0;")
+    if extra:
+        # and quantized for the QuantizeLinear(s) after it, as each value is placed
+        # (fuse.py fold_quantize_into_producer); the float only if anything else reads it
+        b.append("  " + also_q_consts(extra))
+        keep = not all(e.get("float_dead") for e in extra)
     for i,inp in enumerate(ins):
         ash=in_shapes[i]; ad=ash[axis] if axis<len(ash) else 1
+        if extra:
+            if _isq(ctx,inp):
+                sc,zp=_deq(ctx,inp); val=f"{cfloat(sc)}*(float)((int)in{i}[(o*ad+a)*inner+k]-({zp}))"
+            else:
+                val=f"in{i}[(o*ad+a)*inner+k]"
+            dst=f"(o*{cat_dim}+(off+a))*inner+k"
+            b.append(f"  {{ int ad={ad};")
+            b.append(f"    for(int o=0;o<outer;++o) for(int a=0;a<ad;++a) for(int k=0;k<inner;++k){{")
+            b.append(f"      float v={val}; " + (f"y[{dst}]=v; " if keep else "") + also_q_stores(extra, "v", dst) + " }")
+            b.append(f"    off+=ad; }}")
+            continue
         if _isq(ctx,inp):
             sc,zp=_deq(ctx,inp)
             b.append(f"  {{ int ad={ad}; const float s={cfloat(sc)}; const int z={zp};")
@@ -237,12 +255,12 @@ def emit_concat(ctx,node):
             b.append(f"      y[(o*{cat_dim}+(off+a))*inner+k]=s*(float)((int)in{i}[(o*ad+a)*inner+k]-z);")
             b.append(f"    off+=ad; }}")
         else:
+            # a run of ad*inner values per outer row: one memcpy, not a loop of three
             b.append(f"  {{ int ad={ad};")
-            b.append(f"    for(int o=0;o<outer;++o) for(int a=0;a<ad;++a) for(int k=0;k<inner;++k)")
-            b.append(f"      y[(o*{cat_dim}+(off+a))*inner+k]=in{i}[(o*ad+a)*inner+k];")
+            b.append(f"    for(int o=0;o<outer;++o) memcpy(y+(o*{cat_dim}+off)*inner, in{i}+o*ad*inner, ad*inner*sizeof(*y));")
             b.append(f"    off+=ad; }}")
     b.append("}"); b.append("")
-    ctx.calls.append((node,fn,list(ins)+[outs]))
+    ctx.calls.append((node,fn,list(ins)+[outs]+[e["dst"] for e in extra]))
 
 def _emit_concat_int8(ctx,node,axis):
     """Concat whose inputs and output are int8 of one quantization (fuse.py
@@ -275,7 +293,8 @@ def emit_split(ctx,node):
     x=node["inputs"][0]; axis=node["attrs"].get("axis",0); fn=fsan(node["name"])
     xsh=ctx.shape(x); rank=len(xsh)
     if axis<0: axis+=rank
-    outs=node["outputs"]
+    outs=main_outputs(node)
+    extra=also_q(node)
     sizes=node["attrs"].get("split", None)
     if sizes is None and len(node["inputs"])>1:
         # opset-13+ Split: sizes are the 2nd input tensor (now inlined as a value)
@@ -284,7 +303,7 @@ def emit_split(ctx,node):
     if sizes is None:
         each=xsh[axis]//len(outs); sizes=[each]*len(outs)
     ct=_ct(ctx,x)
-    args=[f"const {ct}* x"]+[f"{ct}* out{i}" for i in range(len(outs))]
+    args=[f"const {ct}* x"]+[f"{ct}* out{i}" for i in range(len(outs))]+[f"int8_t* q{k}" for k in range(len(extra))]
     sig=_sig(fn,args); ctx.header.append(sig+";")
     b=ctx.body; b.append(f"// Split {node['name']} axis={axis} sizes={sizes}"); b.append(sig+" {")
     outer=1
@@ -292,13 +311,23 @@ def emit_split(ctx,node):
     inner=1
     for d in xsh[axis+1:]: inner*=d
     b.append(f"  int outer={outer}, inner={inner}, off=0;")
+    if extra:
+        b.append("  " + also_q_consts(extra))
     for i,sz in enumerate(sizes):
-        b.append(f"  {{ int sd={sz}; for(int o=0;o<outer;++o) for(int a=0;a<sd;++a)")
-        b.append(f"      for(int k=0;k<inner;++k)")
-        b.append(f"        out{i}[(o*sd+a)*inner+k]=x[(o*{xsh[axis]}+(off+a))*inner+k];")
+        mine=[(k,e) for k,e in enumerate(extra) if e["src"]==outs[i]]
+        if mine:
+            # this part quantized as it is copied, for the QuantizeLinear(s) after it
+            keep = not all(e.get("float_dead") for _,e in mine)
+            stores=" ".join(quant_c(f"q{k}[o*sd*inner+j]", "v", inv=f"inv{k}", z=f"z{k}") for k,_ in mine)
+            b.append(f"  {{ int sd={sz}; for(int o=0;o<outer;++o) for(int j=0;j<sd*inner;++j){{")
+            b.append(f"      float v=x[(o*{xsh[axis]}+off)*inner+j]; " + (f"out{i}[o*sd*inner+j]=v; " if keep else "") + stores + " }")
+            b.append(f"    off+=sd; }}")
+            continue
+        b.append(f"  {{ int sd={sz}; for(int o=0;o<outer;++o)")
+        b.append(f"      memcpy(out{i}+o*sd*inner, x+(o*{xsh[axis]}+off)*inner, sd*inner*sizeof(*x));")
         b.append(f"    off+=sd; }}")
     b.append("}"); b.append("")
-    ctx.calls.append((node,fn,["x"]+[f"out{i}" for i in range(len(outs))]))
+    ctx.calls.append((node,fn,[x]+list(outs)+[e["dst"] for e in extra]))
 
 # ---------------- Transpose (general N-D permute, static perm) ----------------
 @register("Transpose")
@@ -316,6 +345,22 @@ def emit_transpose(ctx,node):
     ysh=[xsh[p] for p in perm]; n=numel(xsh)
     xstr=_strides(xsh); ystr=_strides(ysh)
     ct=_ct(ctx,x)
+    blocks=_as_2d_transpose(xsh, perm)
+    if blocks:
+        batch, A, B = blocks
+        sig=_sig(fn,[f"const {ct}* x",f"{ct}* y"]); ctx.header.append(sig+";")
+        b=ctx.body; b.append(f"// Transpose {node['name']} perm={perm}: [{batch}][{A}][{B}] -> [{batch}][{B}][{A}], in tiles")
+        b.append(sig+" {")
+        # Element by element, one side of a transpose strides through memory a value at a
+        # time -- on an MCU, a PSRAM cache line fetched for each value written. In
+        # 16 x 16 tiles both sides stay within a few lines.
+        b.append(f"  const int A={A}, B={B}, T=16;")
+        b.append(f"  for(int n=0;n<{batch};++n){{ const {ct}* xb=x+n*A*B; {ct}* yb=y+n*A*B;")
+        b.append(f"    for(int a0=0;a0<A;a0+=T) for(int b0=0;b0<B;b0+=T){{")
+        b.append(f"      const int a1=a0+T<A?a0+T:A, b1=b0+T<B?b0+T:B;")
+        b.append(f"      for(int a=a0;a<a1;++a) for(int c=b0;c<b1;++c) yb[c*A+a]=xb[a*B+c]; }} }}")
+        b.append("}"); b.append("")
+        ctx.calls.append((node,fn,["x","y"])); return
     sig=_sig(fn,[f"const {ct}* x",f"{ct}* y"]); ctx.header.append(sig+";")
     b=ctx.body; b.append(f"// Transpose {node['name']} perm={perm}"); b.append(sig+" {")
     # emit nested loops over output index, map to input via perm
@@ -329,6 +374,19 @@ def emit_transpose(ctx,node):
     b.append("}"); b.append("")
     ctx.calls.append((node,fn,["x","y"]))
 
+def _as_2d_transpose(shape, perm):
+    """(batch, A, B) when [perm] keeps some leading dims and swaps the two groups of dims
+    after them -- NHWC <-> NCHW, a matrix's last two axes -- so the transpose is of a
+    batch of A x B matrices; else None."""
+    k=0
+    while k<len(perm) and perm[k]==k: k+=1
+    rest=perm[k:]; r=len(perm)
+    for m in range(k+1, r):
+        if rest==list(range(m, r))+list(range(k, m)):
+            batch=numel(shape[:k]) if k else 1
+            return batch, numel(shape[k:m]), numel(shape[m:])
+    return None
+
 # ---------------- Reshape (pure copy; layout identical) ----------------
 @register("Reshape")
 def emit_reshape(ctx,node):
@@ -336,7 +394,7 @@ def emit_reshape(ctx,node):
     ct=_ct(ctx,x)
     sig=_sig(fn,[f"const {ct}* x",f"{ct}* y"]); ctx.header.append(sig+";")
     b=ctx.body; b.append(f"// Reshape {node['name']} (memcpy)"); b.append(sig+" {")
-    b.append(f"  for(int i=0;i<{n};++i) y[i]=x[i];")
+    b.append(f"  if(y!=x) memcpy(y, x, {n}*sizeof(*x));")
     b.append("}"); b.append(""); ctx.calls.append((node,fn,["x","y"]))
 
 # ---------------- MaxPool (NHWC, static kernel/stride) ----------------
@@ -452,23 +510,33 @@ def emit_add(ctx, node):
         act = "int8_t" if aq else ct
         bct = "int8_t" if bq else _ct(ctx,b)
         yq = ctx.T.get(y,{}).get("dtype")=="int8" and ctx.T[y].get("q_scale") is not None
-        sig=_sig(fn,["const "+act+"* a","const "+bct+"* b", ("int8_t* y" if yq else "float* y")]); ctx.header.append(sig+";")
+        extra=also_q(node)
+        sig=_sig(fn,["const "+act+"* a","const "+bct+"* b", ("int8_t* y" if yq else "float* y")]
+                 +[f"int8_t* q{k}" for k in range(len(extra))]); ctx.header.append(sig+";")
         bd=ctx.body; bd.append("// Add "+node["name"]+" (elementwise, dequant if q"+(", int8 out" if yq else "")+")"); bd.append(sig+" {")
+        ia = "i" if na==ny else f"i%{na}"
+        ib = "i" if nb==ny else f"i%{nb}"
         if aq:
-            sca,zpa=_deq(ctx,a); av=f"({cfloat(sca)}*(float)((int)a[i%{na}] - ({zpa})))"
+            sca,zpa=_deq(ctx,a); av=f"({cfloat(sca)}*(float)((int)a[{ia}] - ({zpa})))"
         else:
-            av=f"a[i%{na}]"
+            av=f"a[{ia}]"
         if bq:
-            scb,zpb=_deq(ctx,b); bv=f"({cfloat(scb)}*(float)((int)b[i%{nb}] - ({zpb})))"
+            scb,zpb=_deq(ctx,b); bv=f"({cfloat(scb)}*(float)((int)b[{ib}] - ({zpb})))"
         else:
-            bv=f"b[i%{nb}]"
+            bv=f"b[{ib}]"
         if yq:
             # the float sum, quantized as the QuantizeLinear after it did (fuse.py int8_layout_paths)
             bd.append(f"  const float inv=1.0f/{cfloat(ctx.T[y]['q_scale'])}; const int z={int(ctx.T[y]['q_zp'])};")
             bd.append(f"  for(int i=0;i<{ny};++i){{ float sum={av}+{bv}; " + quant_c("y[i]", "sum") + " }")
+        elif extra:
+            # and quantized for the QuantizeLinear(s) after it, in the same pass
+            keep = not all(e.get("float_dead") for e in extra)
+            bd.append("  " + also_q_consts(extra))
+            bd.append(f"  for(int i=0;i<{ny};++i){{ float sum={av}+{bv}; " + ("y[i]=sum; " if keep else "")
+                      + also_q_stores(extra, "sum", "i") + " }")
         else:
             bd.append(f"  for(int i=0;i<{ny};++i) y[i]={av}+{bv};")
-        bd.append("}"); bd.append(""); ctx.calls.append((node,fn,[a,b,y]))
+        bd.append("}"); bd.append(""); ctx.calls.append((node,fn,[a,b,y]+[e["dst"] for e in extra]))
 
 
 # ============================================================================

@@ -32,6 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tables are filled on the device by that expression.
 - `fuse.py` `sigmoid_through_layout`: YOLO26n's final class Sigmoid (107,520 `expf`s,
   0.15 s on the S3) is a 256-entry table in each of its three DequantizeLinears.
+  Measured: 5.1 s -> 3.3 s a run.
+- `fuse.py` `fold_quantize_into_producer`: a QuantizeLinear whose float input is also
+  read elsewhere (at another scale, or by a residual Add) is done by the Concat, SiLU,
+  Split or Add that makes the float, in the same pass, so the float is never read back
+  to be quantized; where nothing else reads it, the float is not written at all. 36 of
+  YOLO26n's 39 remaining QuantizeLinears. Bit-identical, on four test images.
+- A model whose first ops quantize its float NCHW input and transpose it to NHWC gets
+  `run_model_int8_input()`, `model_input_int8` and `model_quantize_input()` (its own
+  QuantizeLinear) in `model.h`: the caller writes the int8 NHWC input directly, a byte a
+  value instead of four, and both ops are skipped. The same bytes as `run_model()`.
+- Transpose is tiled 16 x 16 wherever it is a batched 2-D transpose (NHWC <-> NCHW, a
+  matrix's last two axes): element by element, one side wrote a PSRAM cache line per
+  value. Concat, Split and Reshape copy rows with `memcpy`; int8 SiLU tables run a word
+  of four values at a time; Add drops its modulo where both sides are the whole tensor.
 - `FUSE_SILU_QUANTIZE` on by default, where the Quantize is the SiLU's only reader.
 - SiLU becomes a table lookup wherever the graph has Dequantize -> Sigmoid -> Mul, not
   only where a QuantizeLinear follows: removes YOLO26n's 38 float `expf` Sigmoids.
@@ -56,6 +70,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `compare_fuse_modes.py` (fused vs unfused device runs).
 
 ### Fixed
+- `quant_c`'s temporaries could shadow the caller's `v` (`float v=(v)*inv`, reading an
+  uninitialized value); caught by the bit-exact test before release, its names are now
+  its own.
 - The S3 im2col path pads with `-in_offset` as an int8, wrong for `in_offset == -128`
   (an input zero point of 128, which no int8 tensor has, but a uint8 one could); such a
   conv now takes the C reference.

@@ -425,6 +425,48 @@ def sigmoid_through_layout(d):
     return done
 
 
+FOLD_INTO = ("Concat", "SiLU", "Split", "Add")
+
+def fold_quantize_into_producer(d):
+    """A QuantizeLinear that int8_layout_paths could not take away -- its float input is
+    also read at another scale, or by a residual Add -- is folded into what makes that
+    float: the Concat, SiLU, Split or Add writes the int8 too, in the same pass, so the
+    float is not read back from PSRAM to be quantized. Where nothing else reads the
+    float (a Concat that only fed this QuantizeLinear), it is not written at all.
+    The same float, quantized by the QuantizeLinear's own expression: the same bytes.
+    The int8 outputs are listed among the producer's outputs, so the arena keeps them
+    alive from there."""
+    prod, cons = build_maps(d)
+    T = d["tensors"]
+    remove = set(); folded = 0
+    for q in d["nodes"]:
+        if q["op"] != "QuantizeLinear":
+            continue
+        t = q["inputs"][0]; p = prod.get(t)
+        if p is None or T.get(t, {}).get("dtype") != "float32":
+            continue
+        if p["op"] == "SiLU" and "out_scale" in p["attrs"]:
+            continue
+        if p["op"] == "Add" and not all(i in prod for i in p["inputs"][:2]):
+            continue                                  # a constant operand: another emitter form
+        if p["op"] not in FOLD_INTO:
+            continue
+        qp = _qparams(d, q)
+        if qp is None:
+            continue
+        p["attrs"].setdefault("also_q", []).append(
+            {"src": t, "dst": q["outputs"][0], "scale": qp[0], "zp": qp[1]})
+        p["outputs"].append(q["outputs"][0])
+        remove.add(id(q)); folded += 1
+    d["nodes"] = [n for n in d["nodes"] if id(n) not in remove]
+    prod, cons = build_maps(d)
+    outputs = set(d.get("outputs", []))
+    for p in d["nodes"]:
+        for e in p["attrs"].get("also_q", []):
+            e["float_dead"] = not cons.get(e["src"]) and e["src"] not in outputs
+    return folded
+
+
 def topo_sort(d):
     prod={o:n for n in d["nodes"] for o in n["outputs"]}
     seen=set(); order=[]
@@ -453,6 +495,9 @@ def main(inp,out):
         print(f"[fuse] tensors quantized at the source = {n_int8}, QuantizeLinears gone = {n_q}")
     n_sig = sigmoid_through_layout(d)
     print(f"[fuse] Sigmoids folded into their DequantizeLinears = {n_sig}")
+    if INT8_LAYOUT:
+        n_fold = fold_quantize_into_producer(d)
+        print(f"[fuse] QuantizeLinears folded into their producers = {n_fold}")
     topo_sort(d)
     json.dump(d, open(out,"w",encoding="utf-8"), indent=1, ensure_ascii=False)
     print(f"fuse -> {out}: SiLU fused = {n_silu}, nodes now {len(d['nodes'])}")
