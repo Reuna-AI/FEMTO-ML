@@ -64,7 +64,7 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
     # ---- header ----
     with open(out_base+".h","w",encoding="utf-8") as h:
         h.write("// Auto-generated model header. Do not edit.\n#pragma once\n")
-        h.write("#include <stdint.h>\n#include <math.h>\n")
+        h.write("#include <stdint.h>\n#include <string.h>\n#include <math.h>\n")
         h.write('#include "weights.h"\n#include "activations.h"\n\n')
         h.write(f"// target: {target}\n")
         if target=="esp32s3" and (debug or dump):

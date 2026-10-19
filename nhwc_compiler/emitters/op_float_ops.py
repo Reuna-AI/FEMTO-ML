@@ -23,8 +23,8 @@ Contract: every activation is float32 EXCEPT the int8 in/out of a QLinearConv.
 Everything else is pure float32. Structural ops read static attrs from JSON.
 Signatures pass explicit buffers; shapes/attrs baked as literals.
 """
-from . import register
-from .common import fsan, san, wsan, numel, cfloat
+from . import register, REGISTRY
+from .common import fsan, san, wsan, numel, cfloat, quant_c
 
 def _sig(fn, args): return f"void {fn}({', '.join(args)})"
 _CDT={"int8":"int8_t","uint8":"uint8_t","int32":"int32_t","float32":"float","int64":"int64_t"}
@@ -67,16 +67,34 @@ def emit_dq(ctx,node):
     x=node["inputs"][0]; s=node["inputs"][1]; z=node["inputs"][2] if len(node["inputs"])>2 else None
     y=node["outputs"][0]; fn=fsan(node["name"]); n=numel(ctx.shape(x))
     sc=ctx.val0(s); zv=ctx.val0(z) if z is not None else 0
-    sig=_sig(fn,["const int8_t* x","float* y"]); ctx.header.append(sig+";")
+    to_int8 = ctx.T.get(y,{}).get("dtype")=="int8" and ctx.T[y].get("q_scale") is not None
+    then_sigmoid = bool(node["attrs"].get("then_sigmoid"))
+    sig=_sig(fn,["const int8_t* x", ("int8_t* y" if to_int8 else "float* y")]); ctx.header.append(sig+";")
     b=ctx.body
-    b.append(f"// DequantizeLinear {node['name']}")
+    b.append(f"// DequantizeLinear {node['name']}"
+             + ("  -> int8 at the next QuantizeLinear's scale (fuse.py int8_layout_paths)" if to_int8 else "")
+             + ("  -> sigmoid (fuse.py sigmoid_through_layout)" if then_sigmoid else ""))
     b.append(sig+" {")
     if sc is not None:
         b.append(f"  const float s={cfloat(sc)}; const int z={int(zv) if zv is not None else 0};")
     else:  # value not inlined -> read runtime array from weights.h
         zref=(wsan(z)+"[0]") if z is not None else "0"
         b.append(f"  const float s={wsan(s)}[0]; const int z={zref};")
-    b.append(f"  for(int i=0;i<{n};++i) y[i]=s*(float)((int)x[i]-z);")
+    if to_int8 or then_sigmoid:
+        # 256 inputs, so a table -- filled on the first run by the very expressions
+        # the separate ops used, hence the same values to the bit.
+        ty = "int8_t" if to_int8 else "float"
+        b.append(f"  static {ty} lut[256]; static int ready=0;")
+        b.append(f"  if(!ready){{")
+        if to_int8:
+            b.append(f"    const float inv=1.0f/{cfloat(ctx.T[y]['q_scale'])}; const int zo={int(ctx.T[y]['q_zp'])};")
+            b.append(f"    for(int q=-128;q<128;++q){{ float d=s*(float)(q-z); " + quant_c("lut[q+128]", "d", z="zo") + " }")
+        else:
+            b.append(f"    for(int q=-128;q<128;++q){{ float v=s*(float)(q-z); lut[q+128]=1.0f/(1.0f+expf(-v)); }}")
+        b.append(f"    ready=1; }}")
+        b.append(f"  for(int i=0;i<{n};++i) y[i]=lut[(unsigned char)(x[i]+128)];")
+    else:
+        b.append(f"  for(int i=0;i<{n};++i) y[i]=s*(float)((int)x[i]-z);")
     b.append("}"); b.append("")
     ctx.calls.append((node,fn,["x","y"]))
 
@@ -99,10 +117,7 @@ def emit_q(ctx,node):
     # in a QDQ graph (every conv input), and on an FPU without a divider each divide is
     # a long instruction sequence. v is clamped first so the int conversion is defined.
     b.append(f"  const float inv=1.0f/s;")
-    b.append(f"  for(int i=0;i<{n};++i){{ float v=x[i]*inv;")
-    b.append(f"    v = v<-512.0f ? -512.0f : (v>512.0f ? 512.0f : v);")
-    b.append(f"    int r=(int)(v<0.0f ? v-0.5f : v+0.5f)+z;")
-    b.append(f"    if(r<-128)r=-128; if(r>127)r=127; y[i]=(signed char)r; }}")
+    b.append(f"  for(int i=0;i<{n};++i) " + quant_c("y[i]", "x[i]"))
     b.append("}"); b.append("")
     ctx.calls.append((node,fn,["x","y"]))
 
@@ -117,6 +132,17 @@ def _unary(op, cexpr):
         b.append("}"); b.append("")
         ctx.calls.append((node,fn,["x","y"]))
 _unary("Sigmoid","1.0f/(1.0f+expf(-v))")
+_sigmoid_float = REGISTRY["Sigmoid"]
+
+@register("Sigmoid")
+def emit_sigmoid(ctx,node):
+    if not node["attrs"].get("identity"):
+        return _sigmoid_float(ctx,node)
+    x=node["inputs"][0]; y=node["outputs"][0]; fn=fsan(node["name"]); n=numel(ctx.shape(x))
+    sig=_sig(fn,["const float* x","float* y"]); ctx.header.append(sig+";")
+    b=ctx.body; b.append(f"// Sigmoid {node['name']}: done in its DequantizeLinears (fuse.py sigmoid_through_layout)")
+    b.append(sig+" {"); b.append(f"  for(int i=0;i<{n};++i) y[i]=x[i];")
+    b.append("}"); b.append(""); ctx.calls.append((node,fn,["x","y"]))
 
 @register("Pow")
 def emit_pow(ctx,node):
@@ -169,6 +195,8 @@ def emit_concat(ctx,node):
         else:
             # last resort: clamp into range so we at least don't index OOB
             if axis>=len(osh): axis=len(osh)-1
+    if ctx.T.get(outs,{}).get("dtype")=="int8":
+        return _emit_concat_int8(ctx,node,axis)
     # output is float; inputs may be float or int8(quantized) -> dequant per input
     args=[]
     for i,inp in enumerate(ins):
@@ -213,6 +241,32 @@ def emit_concat(ctx,node):
             b.append(f"    for(int o=0;o<outer;++o) for(int a=0;a<ad;++a) for(int k=0;k<inner;++k)")
             b.append(f"      y[(o*{cat_dim}+(off+a))*inner+k]=in{i}[(o*ad+a)*inner+k];")
             b.append(f"    off+=ad; }}")
+    b.append("}"); b.append("")
+    ctx.calls.append((node,fn,list(ins)+[outs]))
+
+def _emit_concat_int8(ctx,node,axis):
+    """Concat whose inputs and output are int8 of one quantization (fuse.py
+    int8_layout_paths): a byte copy, a quarter of the float one's traffic."""
+    outs=node["outputs"][0]; fn=fsan(node["name"]); ins=node["inputs"]
+    osh=ctx.shape(outs); oq=(ctx.T[outs]["q_scale"], ctx.T[outs]["q_zp"])
+    for i in ins:
+        t=ctx.T.get(i,{})
+        if t.get("dtype")!="int8" or (t.get("q_scale"),t.get("q_zp"))!=oq:
+            raise ValueError(f"Concat {node['name']}: int8 output but input {i} is not int8 at {oq}")
+    args=[f"const int8_t* in{i}" for i in range(len(ins))]+["int8_t* y"]
+    sig=_sig(fn,args); ctx.header.append(sig+";")
+    b=ctx.body; b.append(f"// Concat {node['name']} axis={axis} of {len(ins)} (int8, one quantization)")
+    b.append(sig+" {")
+    outer=1
+    for dax in osh[:axis]: outer*=dax
+    inner=1
+    for dax in osh[axis+1:]: inner*=dax
+    cat=osh[axis]
+    b.append(f"  int off=0;")
+    for i,inp in enumerate(ins):
+        ad=ctx.shape(inp)[axis]
+        b.append(f"  for(int o=0;o<{outer};++o) memcpy(y+(o*{cat}+off)*{inner}, in{i}+o*{ad*inner}, {ad*inner});")
+        b.append(f"  off+={ad};")
     b.append("}"); b.append("")
     ctx.calls.append((node,fn,list(ins)+[outs]))
 
@@ -397,8 +451,9 @@ def emit_add(ctx, node):
         aq=_isq(ctx,a); bq=_isq(ctx,b)
         act = "int8_t" if aq else ct
         bct = "int8_t" if bq else _ct(ctx,b)
-        sig=_sig(fn,["const "+act+"* a","const "+bct+"* b", "float* y"]); ctx.header.append(sig+";")
-        bd=ctx.body; bd.append("// Add "+node["name"]+" (elementwise, dequant if q)"); bd.append(sig+" {")
+        yq = ctx.T.get(y,{}).get("dtype")=="int8" and ctx.T[y].get("q_scale") is not None
+        sig=_sig(fn,["const "+act+"* a","const "+bct+"* b", ("int8_t* y" if yq else "float* y")]); ctx.header.append(sig+";")
+        bd=ctx.body; bd.append("// Add "+node["name"]+" (elementwise, dequant if q"+(", int8 out" if yq else "")+")"); bd.append(sig+" {")
         if aq:
             sca,zpa=_deq(ctx,a); av=f"({cfloat(sca)}*(float)((int)a[i%{na}] - ({zpa})))"
         else:
@@ -407,7 +462,12 @@ def emit_add(ctx, node):
             scb,zpb=_deq(ctx,b); bv=f"({cfloat(scb)}*(float)((int)b[i%{nb}] - ({zpb})))"
         else:
             bv=f"b[i%{nb}]"
-        bd.append(f"  for(int i=0;i<{ny};++i) y[i]={av}+{bv};")
+        if yq:
+            # the float sum, quantized as the QuantizeLinear after it did (fuse.py int8_layout_paths)
+            bd.append(f"  const float inv=1.0f/{cfloat(ctx.T[y]['q_scale'])}; const int z={int(ctx.T[y]['q_zp'])};")
+            bd.append(f"  for(int i=0;i<{ny};++i){{ float sum={av}+{bv}; " + quant_c("y[i]", "sum") + " }")
+        else:
+            bd.append(f"  for(int i=0;i<{ny};++i) y[i]={av}+{bv};")
         bd.append("}"); bd.append(""); ctx.calls.append((node,fn,[a,b,y]))
 
 

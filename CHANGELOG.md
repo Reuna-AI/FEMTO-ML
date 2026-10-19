@@ -13,6 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output pixel (and the 1x1 path from flash for every eight): any layer whose filters
   exceed the S3's 32 KB data cache -- most of YOLO26n's MACs -- ran at PSRAM speed.
   Bit-identical results (`tools/test_conv_kernels.c`: PC, and the S3 vector unit in QEMU).
+  Measured on an ESP32-S3 N16R8 beside a camera's live view: 11 s -> 5.1 s a run.
+- The S3's 1x1 QACC path is gone: every plain conv takes the im2col + ACCX path, a 1x1
+  conv being an im2col conv one pixel wide. Reading QACC's 40-bit lanes back cost eight
+  `memcpy` calls per eight outputs, and its MAC loop another per eight channels; the
+  ACCX path takes 1.6x (48 channels in) to 3x (384 in) fewer instructions (counted in
+  QEMU with `-icount`).
+- The ACCX dot product loads its next operands in the instruction that multiplies the
+  current ones; each block keeps its requant multipliers and split shifts beside its
+  filters; the requant is inlined; the row loop keeps its job in registers.
+- `esp_nn_conv_s8_simd_set_cores(2)`: a worker on the other core takes half of each
+  block's output rows (its own im2col window, the block's filters shared).
+- `fuse.py` `int8_layout_paths`: where every path from a float tensor leads, through
+  Split / Concat / Reshape / Transpose / MaxPool / nearest Resize only, to
+  QuantizeLinears of one scale, the producer (SiLU, Add, DequantizeLinear) quantizes as
+  it writes, the layout ops move int8, and those QuantizeLinears go. Bit-identical: the
+  producer quantizes with the QuantizeLinear's own C expression (`quant_c`), and its
+  tables are filled on the device by that expression.
+- `fuse.py` `sigmoid_through_layout`: YOLO26n's final class Sigmoid (107,520 `expf`s,
+  0.15 s on the S3) is a 256-entry table in each of its three DequantizeLinears.
 - `FUSE_SILU_QUANTIZE` on by default, where the Quantize is the SiLU's only reader.
 - SiLU becomes a table lookup wherever the graph has Dequantize -> Sigmoid -> Mul, not
   only where a QuantizeLinear follows: removes YOLO26n's 38 float `expf` Sigmoids.
@@ -37,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `compare_fuse_modes.py` (fused vs unfused device runs).
 
 ### Fixed
+- The S3 im2col path pads with `-in_offset` as an int8, wrong for `in_offset == -128`
+  (an input zero point of 128, which no int8 tensor has, but a uint8 one could); such a
+  conv now takes the C reference.
 - Class scores could never exceed 0.5 (the open question in the docs: "~0.5 confidence").
   The class-logit convs were calibrated on mostly-background anchors, so their int8 range
   ended at 0 (zero point 127) and every positive logit was clamped to 0: sigmoid(0) = 0.5

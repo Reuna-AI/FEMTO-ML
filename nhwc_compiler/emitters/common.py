@@ -55,3 +55,12 @@ def cfloat(v):
         return r+"f"                        # 1.5e-3 -> 1.5e-3f (valid)
     if "." not in r: r+=".0"                # 2 -> 2.0
     return r+"f"
+
+def quant_c(dst, vexpr, inv="inv", z="z"):
+    """C for dst = int8 of float vexpr, as QuantizeLinear makes it: one multiply by
+    1/scale (a float [inv] = 1.0f/s, declared by the caller), rounded half away from
+    zero, plus the zero point [z], saturated. Every op that quantizes uses this, so a
+    value quantized where it is made is the same byte as one quantized after."""
+    return (f"{{ float v=({vexpr})*{inv}; v = v<-512.0f ? -512.0f : (v>512.0f ? 512.0f : v);"
+            f" int r=(int)(v<0.0f ? v-0.5f : v+0.5f)+{z};"
+            f" if(r<-128)r=-128; if(r>127)r=127; {dst}=(signed char)r; }}")

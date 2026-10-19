@@ -38,6 +38,8 @@
 
 #if ESP_NN_S3_SIMD
 #  include "esp_heap_caps.h"
+#  include "freertos/FreeRTOS.h"
+#  include "freertos/task.h"
 #endif
 
 #ifndef max
@@ -160,22 +162,37 @@ void esp_nn_conv_s8_ref(const data_dims_t *input_dims,
 /* Fast buffer                                                         */
 /* ------------------------------------------------------------------ */
 /*
- * Why the S3 paths work in blocks of output channels.
+ * How the S3 path is laid out, and why (October 2026, measured on the board and
+ * counted instruction by instruction in Espressif's QEMU):
  *
- * The S3 reads PSRAM and flash through a 32 KB data cache. The im2col path used to
- * copy a layer's whole filter set to scratch (malloc: PSRAM, being large) and then,
- * for every output pixel, read all of it: out_ch x window bytes, one byte per MAC.
- * Any layer whose filters are bigger than the cache -- most of a detector's compute
- * -- streamed its filters from PSRAM again for each pixel, and the conv ran at the
- * speed of PSRAM, not of the vector unit. The 1x1 path did the same from flash for
- * every eight pixels.
+ * 1. Blocks of output channels. The S3 reads PSRAM and flash through a 32 KB data
+ *    cache. The old im2col path copied a layer's whole filter set to scratch (PSRAM)
+ *    and read all of it for every output pixel, one byte per MAC: any layer with more
+ *    filters than the cache ran at PSRAM speed. Now each conv takes as many output
+ *    channels' filters as fit in one buffer of internal SRAM, runs every pixel
+ *    against them, then the next block. YOLO26n at 256x256: 11 s -> 5.1 s a run.
  *
- * Now each conv takes as many output channels' filters as fit in one buffer of
- * internal SRAM (no cache involved, single-cycle loads), runs every pixel against
- * them, then the next block. The input is walked once per block instead of once, and
- * an im2col window or eight-pixel transpose is rebuilt per block, both small beside
- * the MACs they serve. Results are bit-identical: the same arithmetic in another
- * order of output channels, each still accumulated in full before it is requantized.
+ * 2. One path for every plain conv, 1x1 included. The old 1x1 path transposed
+ *    eight pixels to int16 and accumulated them in QACC; reading QACC's 40-bit lanes
+ *    back cost eight calls to memcpy for every eight outputs, and its MAC loop
+ *    another memcpy per eight channels. A 1x1 conv is an im2col conv whose window is
+ *    one pixel: through the ACCX dot product it takes 1.6x (48 channels in) to 3x
+ *    (384 in) fewer instructions.
+ *
+ * 3. Per output, only what must be per output. Each block's requant multipliers,
+ *    shifts and filter-sum corrections sit beside its filters, the requant is inlined
+ *    and branch-free, and the dot product loads its next operands in the same
+ *    instruction that multiplies the current ones.
+ *
+ * 4. Both cores. With esp_nn_conv_s8_simd_set_cores(2) a worker on the other core
+ *    takes the lower half of each block's output rows (its own im2col window, the
+ *    block's filters shared, read-only). Off by default: the caller knows what else
+ *    the other core does.
+ *
+ * Results are bit-identical to esp_nn_conv_s8_ref() throughout: the same integer
+ * arithmetic, in another order of output channels and pixels, each output
+ * accumulated in full before it is requantized (tools/test_conv_kernels.c, on a PC
+ * and on the S3 vector unit in QEMU).
  */
 static int8_t *s_fast = NULL;
 static int     s_fast_size = 0;
@@ -235,8 +252,8 @@ static int8_t *fast_buf(int *size)
     return s_fast;
 }
 
-/* Kept for callers of the old API: the S3 paths no longer need scratch beyond the
- * fast buffer, so a scratch buffer given here is used as the fast buffer. */
+/* Kept for callers of the old API: the S3 path needs no scratch beyond the fast
+ * buffer, so a scratch buffer given here is used as the fast buffer. */
 void esp_nn_conv_s8_simd_set_scratch_buf(void *buf, int size_bytes)
 {
     esp_nn_conv_s8_simd_set_fast_buf(buf, size_bytes);
@@ -247,18 +264,16 @@ const char *esp_nn_conv_s8_simd_last_path(void)
     return s_last_path;
 }
 
-#define ALIGN16(p) ((int8_t *)(((uintptr_t)(p) + 15) & ~(uintptr_t)15))
-
-/* Path predicates ---------------------------------------------------- */
-__attribute__((unused))
-static int can_use_1x1(const data_dims_t *in, const data_dims_t *filt,
-                       const conv_params_t *p)
+int esp_nn_conv_s8_simd_get_scratch_size(const data_dims_t *input_dims,
+                                         const data_dims_t *filter_dims,
+                                         const data_dims_t *output_dims,
+                                         const conv_params_t *conv_params)
 {
-    return filt->width == 1 && filt->height == 1 &&
-           p->stride.width == 1 && p->stride.height == 1 &&
-           p->padding.width == 0 && p->padding.height == 0 &&
-           (filt->channels == 0 || filt->channels == in->channels);
+    (void)input_dims; (void)filter_dims; (void)output_dims; (void)conv_params;
+    return 0;   /* the S3 path uses the fast buffer only */
 }
+
+#define ALIGN16(p) ((int8_t *)(((uintptr_t)(p) + 15) & ~(uintptr_t)15))
 
 __attribute__((unused))
 static int is_plain_conv(const data_dims_t *in, const data_dims_t *filt)
@@ -266,33 +281,22 @@ static int is_plain_conv(const data_dims_t *in, const data_dims_t *filt)
     return (filt->channels == 0 || filt->channels == in->channels);
 }
 
-/* Output channels per block for each path, given [size] bytes of fast buffer;
- * 0 if even one does not fit. */
-__attribute__((unused))
-static int block_1x1(int size, int in_ch, int out_ch)
-{
-    const int tbuf = (in_ch / 8) * 128 + 16;
-    int block = (size - tbuf - 32) / in_ch;
-    if (block > out_ch) block = out_ch;
-    return block < 1 ? 0 : block;
-}
+/* Per output channel in a block: its aligned filter, and four int32 -- the
+ * filter-sum correction (+ bias), the requant multiplier, and the shift split into
+ * its left and right parts. */
+#define PER_OC_WORDS 4
 
+/* Output channels per block for [size] bytes of fast buffer, with an im2col window
+ * for each of [windows] cores; 0 if even one channel does not fit. The 16 bytes per
+ * window and the 96 at the end are alignment, and the 16 bytes the dot product's
+ * last load may read past a window or a filter. */
 __attribute__((unused))
-static int block_im2col(int size, int window_len, int out_ch)
+static int block_size(int size, int window_len, int out_ch, int windows)
 {
     const int wla = (window_len + 15) & ~15;
-    int block = (size - wla - 64) / (wla + (int)sizeof(int32_t));
+    int block = (size - windows * (wla + 16) - 96) / (wla + PER_OC_WORDS * (int)sizeof(int32_t));
     if (block > out_ch) block = out_ch;
     return block < 1 ? 0 : block;
-}
-
-int esp_nn_conv_s8_simd_get_scratch_size(const data_dims_t *input_dims,
-                                         const data_dims_t *filter_dims,
-                                         const data_dims_t *output_dims,
-                                         const conv_params_t *conv_params)
-{
-    (void)input_dims; (void)filter_dims; (void)output_dims; (void)conv_params;
-    return 0;   /* the S3 paths use the fast buffer only */
 }
 
 /* ================================================================== */
@@ -301,30 +305,33 @@ int esp_nn_conv_s8_simd_get_scratch_size(const data_dims_t *input_dims,
 #if ESP_NN_S3_SIMD
 
 /* ---- aligned int8 dot product via ACCX ---------------------------- *
- * a, b must be 16-byte aligned; len must be a multiple of 16.          */
-static inline int32_t s3_dot_s8_aligned(const int8_t *a, const int8_t *b,
-                                        int len)
+ * a, b 16-byte aligned; len a multiple of 16, at least 16. Each multiply also
+ * loads the next 16 bytes of a, so a pair of a and b is three instructions,
+ * not four; the last of those loads reads 16 bytes past each, unused.          */
+static inline __attribute__((always_inline))
+int32_t s3_dot_s8_aligned(const int8_t *a, const int8_t *b, int len)
 {
     int32_t acc;
     int32_t tmp;
-    __asm__ volatile("ee.zero.accx");
-    while (len >= 32) {
+    int n = len >> 4;                      /* 16-byte vectors */
+
+    __asm__ volatile(
+        "ee.zero.accx\n"
+        "ee.vld.128.ip q0, %[a], 16\n"
+        "ee.vld.128.ip q1, %[b], 16\n"
+        : [a] "+r" (a), [b] "+r" (b) : : "memory");
+
+    while (n >= 2) {
         __asm__ volatile(
-            "ee.vld.128.ip q0, %[a], 16\n"
-            "ee.vld.128.ip q1, %[b], 16\n"
-            "ee.vld.128.ip q2, %[a], 16\n"
             "ee.vld.128.ip q3, %[b], 16\n"
-            "ee.vmulas.s8.accx q0, q1\n"
-            "ee.vmulas.s8.accx q2, q3\n"
-            : [a] "+r" (a), [b] "+r" (b) : : "memory");
-        len -= 32;
-    }
-    if (len >= 16) {
-        __asm__ volatile(
-            "ee.vld.128.ip q0, %[a], 16\n"
+            "ee.vmulas.s8.accx.ld.ip q2, %[a], 16, q0, q1\n"
             "ee.vld.128.ip q1, %[b], 16\n"
-            "ee.vmulas.s8.accx q0, q1\n"
+            "ee.vmulas.s8.accx.ld.ip q0, %[a], 16, q2, q3\n"
             : [a] "+r" (a), [b] "+r" (b) : : "memory");
+        n -= 2;
+    }
+    if (n) {
+        __asm__ volatile("ee.vmulas.s8.accx q0, q1\n" ::: "memory");
     }
     __asm__ volatile(
         "movi.n %[t], 0\n"
@@ -333,119 +340,9 @@ static inline int32_t s3_dot_s8_aligned(const int8_t *a, const int8_t *b,
     return acc;
 }
 
-/* ---- 1x1 path: transpose 8 pixels + QACC parallel MAC -------------- */
-
-static inline void transpose_8x8_s16_simd(const int8_t *input, int stride,
-                                          int16_t offset16, int16_t *out_buf)
-{
-    const int8_t *p = input;
-    int16_t *out = out_buf;
-    int16_t *off_ptr = &offset16;
-
-    __asm__ volatile(
-        "ee.vldbc.16 q5, %[off]\n"
-        "ee.zero.q q7\n"
-        "ee.vld.l.64.xp q0, %[p], %[s]\n"
-        "ee.vld.l.64.xp q1, %[p], %[s]\n"
-        "ee.vld.h.64.xp q0, %[p], %[s]\n"
-        "ee.vld.h.64.xp q1, %[p], %[s]\n"
-        "ee.vld.l.64.xp q2, %[p], %[s]\n"
-        "ee.vzip.8 q0, q1\n"
-        "ee.vld.l.64.xp q3, %[p], %[s]\n"
-        "ee.vld.h.64.xp q2, %[p], %[s]\n"
-        "ee.vld.h.64.ip q3, %[p], 0\n"
-        "ee.vzip.16 q0, q1\n"
-        "ee.vzip.8 q2, q3\n"
-        "ee.vzip.16 q2, q3\n"
-        "ee.vzip.32 q0, q2\n"
-        "ee.vcmp.lt.s8 q4, q2, q7\n"
-        "ee.vzip.8 q2, q4\n"
-        "ee.vcmp.lt.s8 q6, q0, q7\n"
-        "ee.vzip.8 q0, q6\n"
-        "ee.vadds.s16 q0, q0, q5\n"
-        "ee.vst.128.ip q0, %[out], 16\n"
-        "ee.vadds.s16 q6, q6, q5\n"
-        "ee.vst.128.ip q6, %[out], 16\n"
-        "ee.vadds.s16 q2, q2, q5\n"
-        "ee.vst.128.ip q2, %[out], 16\n"
-        "ee.vadds.s16 q4, q4, q5\n"
-        "ee.vst.128.ip q4, %[out], 16\n"
-        "ee.vzip.32 q1, q3\n"
-        "ee.vcmp.lt.s8 q4, q3, q7\n"
-        "ee.vzip.8 q3, q4\n"
-        "ee.vcmp.lt.s8 q6, q1, q7\n"
-        "ee.vzip.8 q1, q6\n"
-        "ee.vadds.s16 q1, q1, q5\n"
-        "ee.vst.128.ip q1, %[out], 16\n"
-        "ee.vadds.s16 q6, q6, q5\n"
-        "ee.vst.128.ip q6, %[out], 16\n"
-        "ee.vadds.s16 q3, q3, q5\n"
-        "ee.vst.128.ip q3, %[out], 16\n"
-        "ee.vadds.s16 q4, q4, q5\n"
-        "ee.vst.128.ip q4, %[out], 16\n"
-        : [p] "+r" (p), [out] "+r" (out), [off] "+r" (off_ptr)
-        : [s] "r" (stride)
-        : "memory");
-}
-
-static inline void mac_8pos_8ch_simd(const int16_t *data_buf,
-                                     const int8_t *filter)
-{
-    int8_t __attribute__((aligned(16))) f_aligned[16];
-    memcpy(f_aligned, filter, 8);
-
-    const int16_t *dp = data_buf;
-    const int8_t *fp = f_aligned;
-    __asm__ volatile(
-        "ee.zero.q q5\n"
-        "ee.vld.l.64.ip q7, %[f], 0\n"
-        "ee.vld.128.ip q0, %[d], 16\n"
-        "ee.vld.128.ip q1, %[d], 16\n"
-        "ee.vcmp.lt.s8 q6, q7, q5\n"
-        "ee.vzip.8 q7, q6\n"
-        "ee.vsmulas.s16.qacc.ld.incp q2, %[d], q0, q7, 0\n"
-        "ee.vsmulas.s16.qacc.ld.incp q3, %[d], q1, q7, 1\n"
-        "ee.vsmulas.s16.qacc.ld.incp q0, %[d], q2, q7, 2\n"
-        "ee.vsmulas.s16.qacc.ld.incp q1, %[d], q3, q7, 3\n"
-        "ee.vsmulas.s16.qacc.ld.incp q2, %[d], q0, q7, 4\n"
-        "ee.vsmulas.s16.qacc.ld.incp q3, %[d], q1, q7, 5\n"
-        "ee.vsmulas.s16.qacc q2, q7, 6\n"
-        "ee.vsmulas.s16.qacc q3, q7, 7\n"
-        : [d] "+r" (dp), [f] "+r" (fp) : : "memory");
-}
-
-static inline void qacc_zero(void)
-{
-    __asm__ volatile("ee.zero.qacc");
-}
-
-/* The eight 40-bit QACC lanes, low 32 bits each. */
-static inline void qacc_read8(int32_t *qacc)
-{
-    int8_t __attribute__((aligned(16))) qraw[24];
-    int8_t *qp = qraw;
-    __asm__ volatile(
-        "ee.st.qacc_l.l.128.ip %[p], 16\n"
-        "ee.st.qacc_l.h.32.ip  %[p], -16\n"
-        : [p] "+r" (qp) : : "memory");
-    memcpy(&qacc[0], qraw + 0, 4);
-    memcpy(&qacc[1], qraw + 5, 4);
-    memcpy(&qacc[2], qraw + 10, 4);
-    memcpy(&qacc[3], qraw + 15, 4);
-    qp = qraw;
-    __asm__ volatile(
-        "ee.st.qacc_h.l.128.ip %[p], 16\n"
-        "ee.st.qacc_h.h.32.ip  %[p], -16\n"
-        : [p] "+r" (qp) : : "memory");
-    memcpy(&qacc[4], qraw + 0, 4);
-    memcpy(&qacc[5], qraw + 5, 4);
-    memcpy(&qacc[6], qraw + 10, 4);
-    memcpy(&qacc[7], qraw + 15, 4);
-}
-
 #elif defined(ESP_NN_S3_EMULATE)
 
-/* Plain-C stand-ins with the vector instructions' results, for the PC test. */
+/* Plain C with the vector instructions' result, for the PC test. */
 static inline int32_t s3_dot_s8_aligned(const int8_t *a, const int8_t *b, int len)
 {
     int32_t acc = 0;
@@ -453,152 +350,166 @@ static inline int32_t s3_dot_s8_aligned(const int8_t *a, const int8_t *b, int le
     return acc;
 }
 
-static inline void transpose_8x8_s16_simd(const int8_t *input, int stride,
-                                          int16_t offset16, int16_t *out_buf)
-{
-    for (int ch = 0; ch < 8; ch++)
-        for (int pos = 0; pos < 8; pos++)
-            out_buf[ch * 8 + pos] = (int16_t)(input[pos * stride + ch] + offset16);
-}
-
-static int64_t s_emul_qacc[8];
-
-static inline void qacc_zero(void)
-{
-    memset(s_emul_qacc, 0, sizeof(s_emul_qacc));
-}
-
-static inline void mac_8pos_8ch_simd(const int16_t *data_buf, const int8_t *filter)
-{
-    for (int ch = 0; ch < 8; ch++)
-        for (int pos = 0; pos < 8; pos++)
-            s_emul_qacc[pos] += (int32_t)data_buf[ch * 8 + pos] * filter[ch];
-}
-
-static inline void qacc_read8(int32_t *qacc)
-{
-    for (int i = 0; i < 8; i++) qacc[i] = (int32_t)s_emul_qacc[i];
-}
-
 #endif
 
 #if ESP_NN_S3_PATHS
 
-static inline void transpose_8x8_s16_c(const int8_t *input, int stride,
-                                       int32_t input_offset, int16_t *out_buf)
+/* nn_requantize(), inlined, with the shift already split into its left and right
+ * parts: the same arithmetic in the same order. The doubling high multiply can only
+ * overflow for INT32_MIN * INT32_MIN, which saturates as before. */
+static inline __attribute__((always_inline))
+int32_t requant_fast(int32_t val, int32_t mult, int32_t left, int32_t right)
 {
-    for (int ch = 0; ch < 8; ch++) {
-        for (int pos = 0; pos < 8; pos++) {
-            out_buf[ch * 8 + pos] =
-                (int16_t)(input[pos * stride + ch] + input_offset);
-        }
+    const int32_t a = val * ((int32_t)1 << left);
+    int32_t x;
+    if (__builtin_expect(a == INT32_MIN && mult == INT32_MIN, 0)) {
+        x = INT32_MAX;
+    } else {
+        x = (int32_t)(((int64_t)a * mult + ((int64_t)1 << 30)) >> 31);
     }
+    if (right) {
+        const int32_t mask = ((int32_t)1 << right) - 1;
+        const int32_t threshold = (mask >> 1) + (x < 0);
+        x = (x >> right) + ((x & mask) > threshold);
+    }
+    return x;
 }
 
-static inline int8_t requant_out(int32_t acc, int32_t mult, int32_t shift,
-                                 int32_t out_offset, int32_t act_min, int32_t act_max)
+/* One block of output channels over rows [y0, y1): everything a core needs. */
+typedef struct {
+    const int8_t *input;
+    int8_t *out;                 /* output, already offset to the block's first channel */
+    const int8_t *filters;       /* nb aligned filters, wla bytes each */
+    const int32_t *per_oc;       /* nb x {correction, mult, shift} */
+    int8_t *window;              /* this core's im2col window */
+    int32_t in_w, in_h, in_ch, k_w, k_h, stride_w, stride_h, pad_w, pad_h;
+    int32_t out_w, out_ch, nb, window_len, wla;
+    int32_t out_offset, act_min, act_max, pad_val;
+    int32_t safe_x0, safe_x1, safe_y0, safe_y1;
+    int32_t y0, y1;
+} rows_job_t;
+
+static void conv_rows(const rows_job_t *j)
 {
-    acc = nn_requantize(acc, mult, shift);
-    acc += out_offset;
-    acc = max(acc, act_min);
-    acc = min(acc, act_max);
-    return (int8_t)acc;
-}
+    const int32_t row_bytes = j->k_w * j->in_ch;
+    int8_t *out_ptr = j->out + (size_t)j->y0 * j->out_w * j->out_ch;
+    /* In locals: the dot product's asm clobbers memory, which would otherwise have
+     * every field reloaded for every output. */
+    const int8_t *const window = j->window;
+    const int8_t *const filters = j->filters;
+    const int32_t *const per_oc = j->per_oc;
+    const int32_t nb = j->nb, wla = j->wla, out_ch = j->out_ch;
+    const int32_t out_offset = j->out_offset, act_min = j->act_min, act_max = j->act_max;
 
-/* ---- 1x1, stride 1, no pad: blocks of output channels -------------- */
-static void conv_s8_1x1_s3(const int8_t *input,
-                           int input_wd, int input_ht, int in_channels,
-                           int32_t input_offset,
-                           const int8_t *filter_data, const int32_t *bias,
-                           int8_t *out_data, int out_channels,
-                           int32_t out_offset,
-                           const int32_t *out_shift, const int32_t *out_mult,
-                           int32_t activation_min, int32_t activation_max,
-                           int8_t *fast, int fast_size, int block)
-{
-    const int size = input_wd * input_ht;
-    const int ch8 = in_channels / 8;
-    const int use_simd_transpose = (in_channels % 8 == 0) &&
-                                   (((uintptr_t)input & 7) == 0);
-    const int16_t offset16 = (int16_t)input_offset;
+    for (int32_t out_y = j->y0; out_y < j->y1; out_y++) {
+        const int32_t base_y = out_y * j->stride_h - j->pad_h;
+        const int is_safe_y = (out_y >= j->safe_y0 && out_y < j->safe_y1);
 
-    /* fast buffer: [transposed 8 pixels, int16 | this block's filter rows] */
-    int16_t *tbuf = (int16_t *)ALIGN16(fast);
-    int8_t *filt_block = ALIGN16((int8_t *)tbuf + ch8 * 128);
-    (void)fast_size;
+        for (int32_t out_x = 0; out_x < j->out_w; out_x++) {
+            const int32_t base_x = out_x * j->stride_w - j->pad_w;
+            int8_t *buf = j->window;
 
-    for (int oc0 = 0; oc0 < out_channels; oc0 += block) {
-        const int nb = min(block, out_channels - oc0);
-        memcpy(filt_block, filter_data + (size_t)oc0 * in_channels,
-               (size_t)nb * in_channels);
-
-        int pos = 0;
-        for (; pos + 7 < size; pos += 8) {
-            const int8_t *in_base = input + (size_t)pos * in_channels;
-
-            for (int cg = 0; cg < ch8; cg++) {
-                int16_t *cg_buf = tbuf + cg * 64;
-                if (use_simd_transpose) {
-                    transpose_8x8_s16_simd(in_base + cg * 8, in_channels,
-                                           offset16, cg_buf);
-                } else {
-                    transpose_8x8_s16_c(in_base + cg * 8, in_channels,
-                                        input_offset, cg_buf);
+            if (is_safe_y && out_x >= j->safe_x0 && out_x < j->safe_x1) {
+                const int8_t *src = j->input + ((size_t)base_y * j->in_w + base_x) * j->in_ch;
+                for (int32_t fy = 0; fy < j->k_h; fy++) {
+                    memcpy(buf, src, row_bytes);
+                    buf += row_bytes;
+                    src += (size_t)j->in_w * j->in_ch;
                 }
-            }
-            __asm__ volatile("" ::: "memory");
-
-            int8_t *out_pos = out_data + (size_t)pos * out_channels + oc0;
-            for (int ob = 0; ob < nb; ob++) {
-                const int oc = oc0 + ob;
-                const int8_t *filt = filt_block + (size_t)ob * in_channels;
-
-                qacc_zero();
-                for (int cg = 0; cg < ch8; cg++) {
-                    mac_8pos_8ch_simd(tbuf + cg * 64, filt + cg * 8);
-                }
-
-                int32_t qacc[8];
-                qacc_read8(qacc);
-
-                for (int c = ch8 * 8; c < in_channels; c++) {
-                    int16_t f = (int16_t)filt[c];
-                    for (int p = 0; p < 8; p++) {
-                        qacc[p] += ((int32_t)in_base[p * in_channels + c]
-                                    + input_offset) * f;
+            } else {
+                for (int32_t fy = 0; fy < j->k_h; fy++) {
+                    const int32_t in_y = base_y + fy;
+                    if (in_y >= 0 && in_y < j->in_h) {
+                        for (int32_t fx = 0; fx < j->k_w; fx++) {
+                            const int32_t in_x = base_x + fx;
+                            if (in_x >= 0 && in_x < j->in_w) {
+                                memcpy(buf, j->input + ((size_t)in_y * j->in_w + in_x) * j->in_ch,
+                                       j->in_ch);
+                            } else {
+                                memset(buf, j->pad_val, j->in_ch);
+                            }
+                            buf += j->in_ch;
+                        }
+                    } else {
+                        memset(buf, j->pad_val, row_bytes);
+                        buf += row_bytes;
                     }
                 }
-
-                const int32_t b = bias ? bias[oc] : 0;
-                for (int p = 0; p < 8; p++) {
-                    out_pos[p * out_channels + ob] =
-                        requant_out(qacc[p] + b, out_mult[oc], out_shift[oc],
-                                    out_offset, activation_min, activation_max);
-                }
             }
-        }
 
-        /* leftover pixels */
-        for (; pos < size; pos++) {
-            const int8_t *in_ptr = input + (size_t)pos * in_channels;
-            for (int ob = 0; ob < nb; ob++) {
-                const int oc = oc0 + ob;
-                const int8_t *filt = filt_block + (size_t)ob * in_channels;
-                int32_t acc = 0;
-                for (int c = 0; c < in_channels; c++) {
-                    acc += ((int32_t)in_ptr[c] + input_offset) * (int32_t)filt[c];
-                }
-                if (bias) acc += bias[oc];
-                out_data[(size_t)pos * out_channels + oc] =
-                    requant_out(acc, out_mult[oc], out_shift[oc],
-                                out_offset, activation_min, activation_max);
+            const int8_t *filter_ptr = filters;
+            const int32_t *q = per_oc;
+            for (int32_t ob = 0; ob < nb; ob++) {
+                int32_t acc = s3_dot_s8_aligned(window, filter_ptr, wla) + q[0];
+                acc = requant_fast(acc, q[1], q[2], q[3]) + out_offset;
+                acc = max(acc, act_min);
+                acc = min(acc, act_max);
+                out_ptr[ob] = (int8_t)acc;
+                filter_ptr += wla;
+                q += PER_OC_WORDS;
             }
+            out_ptr += out_ch;
         }
     }
 }
 
-/* ---- general path: im2col + ACCX dot product, blocks of output channels --- *
- * Handles padding, any stride, any filter size, any in_ch.                     */
+/* ---- the other core ------------------------------------------------- */
+static int s_cores = 1;
+
+#if ESP_NN_S3_SIMD
+static TaskHandle_t s_worker = NULL;
+static TaskHandle_t s_waiter = NULL;
+static rows_job_t s_job;
+
+static void worker_main(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        conv_rows(&s_job);
+        xTaskNotifyGive(s_waiter);
+    }
+}
+
+int esp_nn_conv_s8_simd_set_cores(int cores)
+{
+    if (cores >= 2 && !s_worker) {
+        const BaseType_t other = xPortGetCoreID() ? 0 : 1;
+        if (xTaskCreatePinnedToCore(worker_main, "femto_nn", 4096, NULL,
+                                    uxTaskPriorityGet(NULL), &s_worker, other) != pdPASS) {
+            s_worker = NULL;
+        }
+    }
+    s_cores = (cores >= 2 && s_worker) ? 2 : 1;
+    return s_cores;
+}
+
+/* Rows [mid, y1) on the worker, [y0, mid) here; back when both are done. */
+static void run_rows(rows_job_t *mine, const rows_job_t *theirs)
+{
+    s_job = *theirs;
+    s_waiter = xTaskGetCurrentTaskHandle();
+    xTaskNotifyGive(s_worker);
+    conv_rows(mine);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+}
+#else
+int esp_nn_conv_s8_simd_set_cores(int cores)
+{
+    /* the PC test: the two halves one after the other, each with its own window */
+    s_cores = cores >= 2 ? 2 : 1;
+    return s_cores;
+}
+
+static void run_rows(rows_job_t *mine, const rows_job_t *theirs)
+{
+    conv_rows(mine);
+    conv_rows(theirs);
+}
+#endif
+
+/* ---- every plain conv: im2col + ACCX dot product, blocks of output channels -- *
+ * Handles 1x1, padding, any stride, any filter size, any in_ch.                   */
 static void conv_s8_im2col_s3(const data_dims_t *input_dims,
                               const int8_t *input_data,
                               const data_dims_t *filter_dims,
@@ -608,122 +519,95 @@ static void conv_s8_im2col_s3(const data_dims_t *input_dims,
                               int8_t *out_data,
                               const conv_params_t *conv_params,
                               const quant_data_t *quant_data,
-                              int8_t *fast, int fast_size, int block)
+                              int8_t *fast, int block, int cores)
 {
-    const int32_t input_wd = input_dims->width;
-    const int32_t input_ht = input_dims->height;
-    const int32_t in_ch = input_dims->channels;
-    const int32_t filter_wd = filter_dims->width;
-    const int32_t filter_ht = filter_dims->height;
-    const int32_t out_wd = output_dims->width;
+    rows_job_t j;
+    j.input = input_data;
+    j.in_w = input_dims->width;
+    j.in_h = input_dims->height;
+    j.in_ch = input_dims->channels;
+    j.k_w = filter_dims->width;
+    j.k_h = filter_dims->height;
+    j.stride_w = conv_params->stride.width;
+    j.stride_h = conv_params->stride.height;
+    j.pad_w = conv_params->padding.width;
+    j.pad_h = conv_params->padding.height;
+    j.out_w = output_dims->width;
+    j.out_ch = output_dims->channels;
+    j.out_offset = conv_params->out_offset;
+    j.act_min = conv_params->activation.min;
+    j.act_max = conv_params->activation.max;
+    j.window_len = j.k_w * j.k_h * j.in_ch;
+    j.wla = (j.window_len + 15) & ~15;
+    /* Padding is written as -input_offset so that, after the correction below
+     * (filter sum x input_offset), it contributes exactly 0. */
+    j.pad_val = (int8_t)(-conv_params->in_offset);
     const int32_t out_ht = output_dims->height;
-    const int32_t out_ch = output_dims->channels;
-    const int32_t pad_wd = conv_params->padding.width;
-    const int32_t pad_ht = conv_params->padding.height;
-    const int32_t stride_wd = conv_params->stride.width;
-    const int32_t stride_ht = conv_params->stride.height;
     const int32_t input_offset = conv_params->in_offset;
-    const int32_t out_offset = conv_params->out_offset;
-    const int32_t activation_min = conv_params->activation.min;
-    const int32_t activation_max = conv_params->activation.max;
-
-    const int32_t window_len = filter_wd * filter_ht * in_ch;
-    const int32_t window_len_aligned = (window_len + 15) & ~15;
-    const int8_t pad_val = (int8_t)(-input_offset);
-    (void)fast_size;
-
-    /* fast buffer: [im2col window | corrections | this block's filters] */
-    int8_t *im2col_buf = ALIGN16(fast);
-    int32_t *corrections = (int32_t *)ALIGN16(im2col_buf + window_len_aligned);
-    int8_t *aligned_filter = ALIGN16((int8_t *)(corrections + block));
-
-    memset(im2col_buf + window_len, 0, window_len_aligned - window_len);
-
-    /* NOTE on the correction trick: it assumes every window element is
-     * (value + input_offset) * filter. Padded elements are written as
-     * -input_offset so they contribute exactly 0 after correction. */
-
-    const int32_t row_bytes = filter_wd * in_ch;
 
     /* interior region where the whole window is inside the input */
-    int32_t safe_y_start = (pad_ht + stride_ht - 1) / stride_ht;
-    int32_t safe_y_end = (input_ht - filter_ht + pad_ht) / stride_ht + 1;
-    int32_t safe_x_start = (pad_wd + stride_wd - 1) / stride_wd;
-    int32_t safe_x_end = (input_wd - filter_wd + pad_wd) / stride_wd + 1;
-    safe_y_start = min(safe_y_start, out_ht);
-    safe_y_end = min(max(safe_y_end, safe_y_start), out_ht);
-    safe_x_start = min(safe_x_start, out_wd);
-    safe_x_end = min(max(safe_x_end, safe_x_start), out_wd);
+    int32_t sy0 = (j.pad_h + j.stride_h - 1) / j.stride_h;
+    int32_t sy1 = (j.in_h - j.k_h + j.pad_h) / j.stride_h + 1;
+    int32_t sx0 = (j.pad_w + j.stride_w - 1) / j.stride_w;
+    int32_t sx1 = (j.in_w - j.k_w + j.pad_w) / j.stride_w + 1;
+    j.safe_y0 = min(sy0, out_ht);
+    j.safe_y1 = min(max(sy1, j.safe_y0), out_ht);
+    j.safe_x0 = min(sx0, j.out_w);
+    j.safe_x1 = min(max(sx1, j.safe_x0), j.out_w);
 
-    for (int32_t oc0 = 0; oc0 < out_ch; oc0 += block) {
-        const int32_t nb = min(block, out_ch - oc0);
+    /* fast buffer: [window per core | per-oc words | this block's filters] */
+    int8_t *window0 = ALIGN16(fast);
+    int8_t *window1 = ALIGN16(window0 + j.wla + 16);
+    int32_t *per_oc = (int32_t *)ALIGN16(window1 + (cores > 1 ? j.wla + 16 : 0));
+    int8_t *filters = ALIGN16((int8_t *)(per_oc + PER_OC_WORDS * block));
 
-        /* This block's filters, zero-padded to the aligned length so the dot
-         * product over it is exact, and filter_sum * input_offset (+ bias). */
-        const int8_t *fptr = filter_data + (size_t)oc0 * window_len;
-        int8_t *af = aligned_filter;
-        for (int32_t ob = 0; ob < nb; ob++) {
+    /* zero the windows' tails once: the dot product runs over the aligned length */
+    memset(window0 + j.window_len, 0, j.wla - j.window_len);
+    if (cores > 1) memset(window1 + j.window_len, 0, j.wla - j.window_len);
+
+    j.filters = filters;
+    j.per_oc = per_oc;
+
+    for (int32_t oc0 = 0; oc0 < j.out_ch; oc0 += block) {
+        j.nb = min(block, j.out_ch - oc0);
+
+        const int8_t *fptr = filter_data + (size_t)oc0 * j.window_len;
+        int8_t *af = filters;
+        int32_t *q = per_oc;
+        for (int32_t ob = 0; ob < j.nb; ob++) {
             int32_t sum = 0;
-            for (int32_t i = 0; i < window_len; i++) sum += fptr[i];
-            corrections[ob] = sum * input_offset + (bias ? bias[oc0 + ob] : 0);
-            memcpy(af, fptr, window_len);
-            memset(af + window_len, 0, window_len_aligned - window_len);
-            fptr += window_len;
-            af += window_len_aligned;
+            for (int32_t i = 0; i < j.window_len; i++) sum += fptr[i];
+            q[0] = sum * input_offset + (bias ? bias[oc0 + ob] : 0);
+            q[1] = quant_data->mult[oc0 + ob];
+            q[2] = quant_data->shift[oc0 + ob] > 0 ? quant_data->shift[oc0 + ob] : 0;
+            q[3] = quant_data->shift[oc0 + ob] > 0 ? 0 : -quant_data->shift[oc0 + ob];
+            memcpy(af, fptr, j.window_len);
+            memset(af + j.window_len, 0, j.wla - j.window_len);
+            fptr += j.window_len;
+            af += j.wla;
+            q += PER_OC_WORDS;
         }
 
-        int8_t *out_ptr = out_data + oc0;
-        for (int32_t out_y = 0; out_y < out_ht; out_y++) {
-            const int32_t base_y = out_y * stride_ht - pad_ht;
-            const int is_safe_y = (out_y >= safe_y_start && out_y < safe_y_end);
-
-            for (int32_t out_x = 0; out_x < out_wd; out_x++) {
-                const int32_t base_x = out_x * stride_wd - pad_wd;
-                int8_t *buf = im2col_buf;
-
-                if (is_safe_y && out_x >= safe_x_start && out_x < safe_x_end) {
-                    for (int32_t fy = 0; fy < filter_ht; fy++) {
-                        const int8_t *src = input_data +
-                            ((base_y + fy) * input_wd + base_x) * in_ch;
-                        memcpy(buf, src, row_bytes);
-                        buf += row_bytes;
-                    }
-                } else {
-                    for (int32_t fy = 0; fy < filter_ht; fy++) {
-                        const int32_t in_y = base_y + fy;
-                        if (in_y >= 0 && in_y < input_ht) {
-                            for (int32_t fx = 0; fx < filter_wd; fx++) {
-                                const int32_t in_x = base_x + fx;
-                                if (in_x >= 0 && in_x < input_wd) {
-                                    memcpy(buf,
-                                           input_data + (in_y * input_wd + in_x) * in_ch,
-                                           in_ch);
-                                } else {
-                                    memset(buf, pad_val, in_ch);
-                                }
-                                buf += in_ch;
-                            }
-                        } else {
-                            memset(buf, pad_val, row_bytes);
-                            buf += row_bytes;
-                        }
-                    }
-                }
-
-                const int8_t *filter_ptr = aligned_filter;
-                for (int32_t ob = 0; ob < nb; ob++) {
-                    const int32_t oc = oc0 + ob;
-                    int32_t conv_out = s3_dot_s8_aligned(im2col_buf, filter_ptr,
-                                                         window_len_aligned);
-                    out_ptr[ob] = requant_out(conv_out + corrections[ob],
-                                              quant_data->mult[oc], quant_data->shift[oc],
-                                              out_offset, activation_min, activation_max);
-                    filter_ptr += window_len_aligned;
-                }
-                out_ptr += out_ch;
-            }
+        j.out = out_data + oc0;
+        if (cores > 1 && out_ht > 1) {
+            rows_job_t mine = j, theirs = j;
+            const int32_t mid = out_ht / 2;
+            mine.window = window0;   mine.y0 = 0;     mine.y1 = mid;
+            theirs.window = window1; theirs.y0 = mid; theirs.y1 = out_ht;
+            run_rows(&mine, &theirs);
+        } else {
+            j.window = window0; j.y0 = 0; j.y1 = out_ht;
+            conv_rows(&j);
         }
     }
+}
+
+#else
+
+int esp_nn_conv_s8_simd_set_cores(int cores)
+{
+    (void)cores;
+    return 1;
 }
 
 #endif /* ESP_NN_S3_PATHS */
@@ -746,36 +630,25 @@ int esp_nn_conv_s8_simd(const data_dims_t *input_dims,
     }
 
 #if ESP_NN_S3_PATHS
-    if (is_plain_conv(input_dims, filter_dims)) {
+    /* The S3 path pads with -in_offset as an int8, so in_offset must be -127..128 (an
+     * int8 input's zero point negated); outside that, the reference does it right. */
+    if (is_plain_conv(input_dims, filter_dims) &&
+        conv_params->in_offset >= -127 && conv_params->in_offset <= 128) {
         int size = 0;
         int8_t *fast = fast_buf(&size);
-        const int out_ch = output_dims->channels;
-
-        if (fast && can_use_1x1(input_dims, filter_dims, conv_params)) {
-            int block = block_1x1(size, input_dims->channels, out_ch);
-            if (block) {
-                s_last_path = "1x1_simd";
-                conv_s8_1x1_s3(input_data,
-                               input_dims->width, input_dims->height,
-                               input_dims->channels, conv_params->in_offset,
-                               filter_data, bias, out_data,
-                               out_ch, conv_params->out_offset,
-                               quant_data->shift, quant_data->mult,
-                               conv_params->activation.min,
-                               conv_params->activation.max,
-                               fast, size, block);
-                return 0;
-            }
-        } else if (fast) {
-            int window = filter_dims->width * filter_dims->height * input_dims->channels;
-            int block = block_im2col(size, window, out_ch);
-            if (block) {
-                s_last_path = "im2col_simd";
-                conv_s8_im2col_s3(input_dims, input_data, filter_dims, filter_data,
-                                  bias, output_dims, out_data, conv_params,
-                                  quant_data, fast, size, block);
-                return 0;
-            }
+        const int window = filter_dims->width * filter_dims->height * input_dims->channels;
+        int cores = s_cores;
+        int block = fast ? block_size(size, window, output_dims->channels, cores) : 0;
+        if (!block && cores > 1) {
+            cores = 1;
+            block = fast ? block_size(size, window, output_dims->channels, 1) : 0;
+        }
+        if (block) {
+            s_last_path = cores > 1 ? "im2col_simd_2core" : "im2col_simd";
+            conv_s8_im2col_s3(input_dims, input_data, filter_dims, filter_data,
+                              bias, output_dims, out_data, conv_params,
+                              quant_data, fast, block, cores);
+            return 0;
         }
     }
 #endif

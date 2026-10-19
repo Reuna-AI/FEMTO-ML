@@ -12,7 +12,7 @@
  * Shapes: every conv shape YOLO26n uses, plus odd ones (channels not a multiple of 8,
  * stride 2, padding, a misaligned input), each with a range of fast-buffer sizes so
  * that a layer runs in one block of output channels, in several, and in one channel
- * at a time.
+ * at a time -- and on one core and on two.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,11 +36,12 @@ static const shape_t SHAPES[] = {
 };
 
 static const int FAST_SIZES[] = { 49152, 8192, 3000, 1400 };
+static const int CORES[] = { 1, 2 };
 
 static unsigned s_seed = 12345;
 static int rnd(void) { s_seed = s_seed * 1103515245u + 12345u; return (int)((s_seed >> 16) & 0x7fff); }
 
-static int run_one(const shape_t *s, int fast_size, int misalign)
+static int run_one(const shape_t *s, int fast_size, int misalign, int cores)
 {
     const int out_w = (s->in_w + 2 * s->pad - s->k) / s->stride + 1;
     const int out_h = (s->in_h + 2 * s->pad - s->k) / s->stride + 1;
@@ -84,6 +85,7 @@ static int run_one(const shape_t *s, int fast_size, int misalign)
 
     esp_nn_conv_s8_ref(&id, in, &fd, filt, bias, &od, a, &cp, &qd);
     esp_nn_conv_s8_simd_set_fast_buf(fast, fast_size);
+    esp_nn_conv_s8_simd_set_cores(cores);
     memset(b, 0x55, n_out);
     esp_nn_conv_s8_simd(&id, in, &fd, filt, bias, &od, b, &cp, &qd);
 
@@ -113,12 +115,15 @@ int test_conv_kernels_main(void)
     int failed = 0, runs = 0;
     for (unsigned i = 0; i < sizeof(SHAPES) / sizeof(SHAPES[0]); i++) {
         for (unsigned j = 0; j < sizeof(FAST_SIZES) / sizeof(FAST_SIZES[0]); j++) {
-            int r = run_one(&SHAPES[i], FAST_SIZES[j], (i + j) % 3 == 2 ? 3 : 0);
-            if (r < 0) continue;
-            failed += r;
-            runs++;
+            for (unsigned c = 0; c < sizeof(CORES) / sizeof(CORES[0]); c++) {
+                int r = run_one(&SHAPES[i], FAST_SIZES[j], (i + j) % 3 == 2 ? 3 : 0, CORES[c]);
+                if (r < 0) continue;
+                failed += r;
+                runs++;
+            }
         }
     }
+    esp_nn_conv_s8_simd_set_cores(1);
     printf("\n%d of %d passed\n", runs - failed, runs);
     return failed;
 }

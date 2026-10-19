@@ -41,6 +41,9 @@ import sys, json, argparse
 # redundant full-tensor requant passes. Set False for the original SiLU-float + separate-Q
 # behavior (byte-identical to the pre-fusion working build).
 FUSE_SILU_QUANTIZE = True
+# Quantize where a value is made rather than after the ops that only move it (see
+# int8_layout_paths). False for the float layout ops of before October 2026.
+INT8_LAYOUT = True
 # --------------------------------------------------------------------------
 
 def build_maps(d):
@@ -263,6 +266,165 @@ def widen_logit_range(d):
         widened+=1
     return widened
 
+# Ops that only move values (or, for MaxPool, pick among them): on int8 they give
+# exactly the int8 of what they give on float, quantizing being monotonic.
+_LAYOUT = {"Concat", "Split", "Reshape", "Transpose", "MaxPool", "Resize"}
+
+def _data_inputs(n):
+    """The inputs of a layout op that carry values (not shapes, scales, sizes)."""
+    if n["op"] == "Concat":
+        return [i for i in n["inputs"] if i]
+    return [n["inputs"][0]] if n["inputs"] else []
+
+def _qparams(d, q):
+    """(scale, zero point) of a QuantizeLinear, as numbers, or None if not inlined."""
+    T = d["tensors"]
+    def v0(name):
+        v = T.get(name, {}).get("value")
+        return v[0] if isinstance(v, list) and len(v) == 1 else None
+    s = v0(q["inputs"][1]) if len(q["inputs"]) > 1 else None
+    z = v0(q["inputs"][2]) if len(q["inputs"]) > 2 else 0
+    if s is None or z is None or T.get(q["inputs"][2], {}).get("dtype", "int8") != "int8":
+        return None
+    return (float(s), int(z))
+
+def int8_layout_paths(d):
+    """Quantize at the source instead of after the layout ops.
+
+    A QDQ graph is float between convs: a SiLU or residual Add writes float, Split /
+    Concat / Reshape / MaxPool / Resize move those floats, and a QuantizeLinear at the
+    end makes the next conv's int8. On an MCU those float tensors are 4 bytes a value
+    in PSRAM, and moving and requantizing them was a third of YOLO26n's run.
+
+    When every path from a float tensor leads, through layout ops only, to
+    QuantizeLinear(s) of the same scale and zero point, the tensor's producer quantizes
+    as it writes (SiLU through its LUT, Add after its float add, DequantizeLinear as an
+    int8->int8 table), the layout ops move int8, and those QuantizeLinears go. The
+    values are bit-identical: the producer computes the same float and quantizes it
+    with the QuantizeLinear's own C expression, and moving or taking the max of
+    quantized values gives the quantized moved or max value. A tensor that anything
+    else reads (a residual Add, a MatMul, the graph's output) stays float.
+    """
+    prod, cons = build_maps(d)
+    T = d["tensors"]
+    outputs = set(d.get("outputs", []))
+    PRODUCERS = {"SiLU", "Add", "DequantizeLinear"}
+
+    def is_float_act(t):
+        m = T.get(t, {})
+        return m.get("dtype") == "float32" and m.get("kind") != "init" and t in prod
+
+    def producer_ok(t):
+        p = prod[t]
+        if p["op"] == "SiLU":
+            return "out_scale" not in p["attrs"]          # the float-output form
+        if p["op"] == "Add":                              # two activations, float out
+            return all(is_float_act(i) or (T.get(i, {}).get("dtype") == "int8" and i in prod)
+                       for i in p["inputs"][:2])
+        if p["op"] == "DequantizeLinear":
+            return _qparams(d, {"inputs": p["inputs"]}) is not None
+        if p["op"] == "Resize":
+            return p["attrs"].get("mode", "nearest") == "nearest"
+        return p["op"] in _LAYOUT
+
+    banned = set()
+    while True:
+        # what each float tensor would be quantized to, from its readers back
+        want = {}
+        changed = True
+        while changed:
+            changed = False
+            for t in list(T):
+                if t in want or t in banned or t in outputs or not is_float_act(t):
+                    continue
+                readers = cons.get(t, [])
+                if not readers:
+                    continue
+                params = set()
+                for c in readers:
+                    if c["op"] == "QuantizeLinear" and c["inputs"][0] == t:
+                        qp = _qparams(d, c)
+                        params.add(qp if qp else "no")
+                    elif c["op"] in _LAYOUT and t in _data_inputs(c) and all(
+                            o in want for o in c["outputs"]):
+                        params.update(want[o] for o in c["outputs"])
+                    else:
+                        params.add("no")
+                if len(params) == 1 and "no" not in params:
+                    want[t] = params.pop()
+                    changed = True
+        # which of those can be written as int8: their producer can, or is a layout
+        # op all of whose value inputs are int8 of the same quantization
+        ok = {t for t in want if producer_ok(t)}
+        changed = True
+        while changed:
+            changed = False
+            for t in list(ok):
+                p = prod[t]
+                if p["op"] in _LAYOUT and not all(
+                        i in ok and want[i] == want[t] for i in _data_inputs(p)):
+                    ok.discard(t); changed = True
+                if p["op"] in _LAYOUT and not all(o in ok for o in p["outputs"]):
+                    ok.discard(t); changed = True
+        new_banned = banned | (set(want) - ok)
+        if new_banned == banned:
+            break
+        banned = new_banned
+
+    # rewrite: int8 tensors, the QuantizeLinears they make redundant gone
+    for t in ok:
+        s_, z_ = want[t]
+        T[t]["dtype"] = "int8"
+        T[t]["q_scale"] = s_
+        T[t]["q_zp"] = z_
+    remove = set(); rewrite = {}
+    for n in d["nodes"]:
+        if n["op"] == "QuantizeLinear" and n["inputs"][0] in ok:
+            rewrite[n["outputs"][0]] = n["inputs"][0]
+            remove.add(id(n))
+    d["nodes"] = [n for n in d["nodes"] if id(n) not in remove]
+    for n in d["nodes"]:
+        n["inputs"] = [rewrite.get(i, i) for i in n["inputs"]]
+    d["outputs"] = [rewrite.get(o, o) for o in d.get("outputs", [])]
+    return len(ok), len(remove)
+
+
+def sigmoid_through_layout(d):
+    """A Sigmoid whose input is DequantizeLinear outputs moved by layout ops only (YOLO
+    class scores: three heads, reshaped and concatenated) becomes a table in each
+    DequantizeLinear: int8 in, sigmoid(dequant) out, filled once on the device with the
+    same C expression -- so the same floats, without an expf per value. The Sigmoid
+    node stays, as a copy."""
+    prod, cons = build_maps(d)
+    done = 0
+    for n in d["nodes"]:
+        if n["op"] != "Sigmoid":
+            continue
+        sources, stack, fine = [], [n["inputs"][0]], True
+        while stack and fine:
+            t = stack.pop()
+            p = prod.get(t)
+            if p is None:
+                fine = False
+            elif p["op"] == "DequantizeLinear":
+                sources.append(p)
+            elif p["op"] in ("Reshape", "Concat", "Transpose", "Flatten") and \
+                    all(len(cons.get(o, [])) == 1 for o in p["outputs"]):
+                stack.extend(_data_inputs(p))
+            else:
+                fine = False
+            # nothing else may read what is about to become a sigmoid
+            if fine and len(cons.get(t, [])) != 1:
+                fine = False
+        if not fine or not sources:
+            continue
+        for p in sources:
+            p["attrs"]["then_sigmoid"] = 1
+        n["attrs"]["identity"] = 1
+        done += 1
+    return done
+
+
 def topo_sort(d):
     prod={o:n for n in d["nodes"] for o in n["outputs"]}
     seen=set(); order=[]
@@ -286,6 +448,11 @@ def main(inp,out):
     print(f"[fuse] SiLU={n_silu}"
           + ("  (SiLU+Q FUSED: int8->int8)" if FUSE_SILU_QUANTIZE
              else "  (SiLU+Q UNFUSED: float SiLU + separate Q)"))
+    if INT8_LAYOUT:
+        n_int8, n_q = int8_layout_paths(d)
+        print(f"[fuse] tensors quantized at the source = {n_int8}, QuantizeLinears gone = {n_q}")
+    n_sig = sigmoid_through_layout(d)
+    print(f"[fuse] Sigmoids folded into their DequantizeLinears = {n_sig}")
     topo_sort(d)
     json.dump(d, open(out,"w",encoding="utf-8"), indent=1, ensure_ascii=False)
     print(f"fuse -> {out}: SiLU fused = {n_silu}, nodes now {len(d['nodes'])}")

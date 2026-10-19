@@ -123,6 +123,8 @@ Inference is **~8.9 s at 256×256**, and this is **inherent, not a bug**:
 
 **Revisited (October 2026): memory, not MACs.** `428M ÷ ~50 MMAC/s` is 0.2 MAC a cycle, against the 16 the S3's vector MAC does. The im2col path read a layer's whole filter set for every output pixel (one byte per MAC) from a PSRAM scratch copy, and the S3 sees PSRAM through a 32 KB data cache: every layer whose filters are larger -- most of the compute -- ran at PSRAM bandwidth. The S3 convs now run in blocks of output channels whose filters fit in internal SRAM (see `esp_nn_conv_s8_simd.c`, "Fast buffer"); build with `-D FEMTO_PROFILE=1` to see each node's time on the board.
 
+Measured with that profiler on an ESP32-S3 N16R8, beside a camera's live view: 11 s -> **5.1 s** a run, of which convs 3.35 s, QuantizeLinear 0.44 s, Concat 0.29 s, SiLU 0.25 s, Transpose 0.17 s, the final Sigmoid 0.15 s, Split 0.11 s. Everything outside the convs was moving float tensors through PSRAM at ~40 MB/s. What followed: every plain conv on the ACCX path (the 1x1 QACC path cost more instructions per MAC), both cores, int8 instead of float where a tensor only goes through layout ops to a QuantizeLinear (`int8_layout_paths`), the final Sigmoid as tables. What remains of the float traffic is tensors read by a residual Add, or quantized at two different scales (a C2f split half feeding both the next conv and the concat): giving a producer one int8 output per scale is the next step there.
+
 Input resolution remains a lever on top of that, as a model re‑export, not a compiler change:
 
 | Input | Approx MACs | Approx time |
