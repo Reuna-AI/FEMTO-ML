@@ -6,7 +6,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- ESP32-S3 convolutions run in blocks of output channels whose filters fit in a "fast
+  buffer" of internal SRAM (`esp_nn_conv_s8_simd_set_fast_buf()`, else taken on the first
+  conv). Before, the im2col path re-read a layer's whole filter set from PSRAM for every
+  output pixel (and the 1x1 path from flash for every eight): any layer whose filters
+  exceed the S3's 32 KB data cache -- most of YOLO26n's MACs -- ran at PSRAM speed.
+  Bit-identical results (`tools/test_conv_kernels.c`: PC, and the S3 vector unit in QEMU).
+- `FUSE_SILU_QUANTIZE` on by default, where the Quantize is the SiLU's only reader.
+- SiLU becomes a table lookup wherever the graph has Dequantize -> Sigmoid -> Mul, not
+  only where a QuantizeLinear follows: removes YOLO26n's 38 float `expf` Sigmoids.
+- QuantizeLinear multiplies by 1/scale and rounds inline instead of a float divide and
+  `lroundf` per element.
+- TopK is one pass with a K-entry heap instead of K passes (YOLO26n: 300 x 24000);
+  same order, ties to the lower index.
+
 ### Added
+- `FEMTO_PROFILE=1`: the generated `run_model()` times every node (`femto_profile.c`) and
+  `femto_prof_report()` gives the time per op type and the slowest nodes.
+- `tools/test_conv_kernels.c`: the conv paths against the C reference, bit for bit, over
+  every YOLO26n conv shape and odd ones, with fast buffers from one block to many.
 - Depthwise convolution support (scalar kernel + esp-nn depthwise SIMD library integration).
 - TFLite-style integer requantization across all convolution paths.
 - Hybrid fast-RAM / large-RAM (e.g. SRAM/PSRAM) arena placement, configurable via
@@ -18,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `compare_fuse_modes.py` (fused vs unfused device runs).
 
 ### Fixed
+- Class scores could never exceed 0.5 (the open question in the docs: "~0.5 confidence").
+  The class-logit convs were calibrated on mostly-background anchors, so their int8 range
+  ended at 0 (zero point 127) and every positive logit was clamped to 0: sigmoid(0) = 0.5
+  for every confident detection, and TopK could not rank them. `fuse.py` now moves such a
+  conv's zero point to 0 when its output reaches a Sigmoid (`widen_logit_range`): the
+  scale and multipliers are unchanged, scores below 0.5 are unchanged, and above it they
+  are real again (a clear person ~0.88 rather than 0.500).
+- The float SiLU fusion dropped its DequantizeLinear without checking that nothing else
+  read it.
 - Depthwise weights were run through the generic OHWI transpose, transposing the kernel
   spatially (kh <-> kw); now repacked explicitly to [Kh,Kw,K].
 - Quantized residual `Add`/`Concat` inputs were not being dequantized (raw int8 added to

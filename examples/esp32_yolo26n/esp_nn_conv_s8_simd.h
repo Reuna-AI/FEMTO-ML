@@ -29,11 +29,12 @@
  *   };
  *   quant_data_t quant = { .shift = per_ch_shift, .mult = per_ch_mult };
  *
- *   // 1) (optional but recommended) give the library a scratch buffer.
- *   //    If you skip this, it mallocs/caches one internally.
- *   int need = esp_nn_conv_s8_simd_get_scratch_size(&in_dims, &filt_dims,
- *                                                   &out_dims, &params);
- *   esp_nn_conv_s8_simd_set_scratch_buf(my_buffer, my_buffer_size);
+ *   // 1) (optional) give the library its fast buffer: internal SRAM, 8-48 KB.
+ *   //    Each conv runs in blocks of output channels whose filters fit in it
+ *   //    (see "Fast buffer" in the .c). If you skip this, the first conv takes
+ *   //    the largest of 32/24/16/8 KB of internal SRAM it can get, or 16 KB of
+ *   //    PSRAM -- without regard to what wifi or TLS will need later.
+ *   esp_nn_conv_s8_simd_set_fast_buf(my_sram_buffer, my_sram_buffer_size);
  *
  *   // 2) run the convolution
  *   esp_nn_conv_s8_simd(&in_dims, input, &filt_dims, filter, bias,
@@ -106,18 +107,23 @@ typedef struct {
 #endif /* ESP_NN_SIMD_USE_ESP_NN_DEFS */
 
 /**
- * Scratch bytes required for the given conv shape (worst case for the path
- * that will actually be chosen). Returns 0 if no scratch is needed.
+ * Give the S3 paths their fast buffer (internal SRAM; any alignment). Pass NULL,0
+ * to let the library take its own on the next conv.
+ */
+void esp_nn_conv_s8_simd_set_fast_buf(void *buf, int size_bytes);
+
+/** Bytes of fast buffer in use; 0 before the first conv if none was given. */
+int esp_nn_conv_s8_simd_fast_size(void);
+
+/**
+ * Kept for the old API: always 0 now, as the S3 paths need only the fast buffer.
  */
 int esp_nn_conv_s8_simd_get_scratch_size(const data_dims_t *input_dims,
                                          const data_dims_t *filter_dims,
                                          const data_dims_t *output_dims,
                                          const conv_params_t *conv_params);
 
-/**
- * Provide a user-owned scratch buffer (any alignment; aligned internally).
- * Pass NULL,0 to revert to internal malloc'd scratch.
- */
+/** Kept for the old API: the same as esp_nn_conv_s8_simd_set_fast_buf(). */
 void esp_nn_conv_s8_simd_set_scratch_buf(void *buf, int size_bytes);
 
 /**

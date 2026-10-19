@@ -40,7 +40,7 @@ import sys, json, argparse
 # Fold the QuantizeLinear that follows a SiLU into the SiLU's int8 LUT, removing ~50
 # redundant full-tensor requant passes. Set False for the original SiLU-float + separate-Q
 # behavior (byte-identical to the pre-fusion working build).
-FUSE_SILU_QUANTIZE = False
+FUSE_SILU_QUANTIZE = True
 # --------------------------------------------------------------------------
 
 def build_maps(d):
@@ -96,13 +96,19 @@ def fuse_silu(d):
                     q_after = None
                     for c in cons.get(n["outputs"][0],[]):
                         if c["op"]=="QuantizeLinear": q_after=c
-                    if D and D["op"]=="DequantizeLinear" and q_after:
+                    # The DequantizeLinear is dropped below, so nothing but this
+                    # Sigmoid and Mul may read it.
+                    only_silu = D is not None and all(
+                        c is sig or c is n for c in cons.get(sx, []))
+                    if D and D["op"]=="DequantizeLinear" and only_silu:
                         in_s,in_zp = qparams_of_DQ(D)
-                        out_s,out_zp = qparams_of_Q(q_after)
                         x_int = D["inputs"][0]                 # int8 conv output
-                        o = q_after["outputs"][0]              # int8 output (feeds next conv)
-                        if FUSE_SILU_QUANTIZE:
+                        if FUSE_SILU_QUANTIZE and q_after and len(cons.get(n["outputs"][0],[]))==1:
+                            out_s,out_zp = qparams_of_Q(q_after)
+                            o = q_after["outputs"][0]          # int8 output (feeds next conv)
                             # FUSED: int8 -> SiLU -> int8 (absorb Dequant + Quantize).
+                            # Only when the Quantize is the Mul's sole reader: a float
+                            # reader too (a residual Add, a Split) needs the float form.
                             rewrite[n["outputs"][0]] = o
                             add.append({"name":o+"_silu","op":"SiLU","inputs":[x_int],"outputs":[o],
                                         "attrs":{"in_scale":in_s,"in_zp":in_zp,
@@ -110,7 +116,10 @@ def fuse_silu(d):
                             remove.add(id(n)); remove.add(id(sig)); remove.add(id(D)); remove.add(id(q_after))
                         else:
                             # UNFUSED: SiLU reads INT8 conv output (LUT is int8-indexed) and
-                            # OUTPUTS FLOAT (no out params); the separate Quantize requantizes.
+                            # OUTPUTS FLOAT (no out params); a separate Quantize, if any,
+                            # requantizes. With none -- the SiLU feeding a Split or a
+                            # residual Add in float -- the LUT still replaces the float
+                            # Dequantize + Sigmoid (expf) + Mul over the whole tensor.
                             # The SiLU LUT does the dequant internally, so DROP the DequantizeLinear
                             # too, but KEEP the QuantizeLinear (it reads the SiLU float output).
                             silu_out = n["outputs"][0]             # Mul's float output (Q reads it)
@@ -208,6 +217,52 @@ def _silu_drop_unfused_outparams(d):
             dropped+=1
     return dropped
 
+def widen_logit_range(d):
+    """Give class-logit convs their positive range back.
+
+    A static-quantized detector's class head is calibrated on images where almost
+    every anchor is background, so its logits are almost all negative and the
+    calibrated int8 range ends at 0: zero point 127, the int8 maximum. Every
+    positive logit -- every confident detection -- is then clamped to 0, and the
+    Sigmoid after it can never give more than 0.5: a clear person and a doubtful one
+    both score 0.500, and the TopK that ranks anchors by score cannot tell them apart.
+
+    The conv's int32 accumulator holds the true logit; only the requantize clamps it.
+    So for a QLinearConv whose int8 output is read only by DequantizeLinear(s) that
+    lead, through shape-only ops, to a Sigmoid, and whose zero point is 127, the zero
+    point is moved to 0. The scale is kept -- so are the requant multipliers -- and
+    the range becomes [-128*s, +127*s] instead of [-255*s, 0]. What is given up is
+    logits below -128*s (sigmoid < 1e-5 at the scales seen): nothing a threshold
+    could ever pass. Scores below 0.5 are unchanged; above it they are now real.
+    """
+    prod,cons=build_maps(d)
+    T=d["tensors"]
+    SHAPE_ONLY={"Reshape","Concat","Transpose","Flatten","Squeeze","Unsqueeze","Identity"}
+    widened=0
+
+    def reaches_sigmoid(t, depth=0):
+        if depth>6: return False
+        for c in cons.get(t,[]):
+            if c["op"]=="Sigmoid": return True
+            if c["op"] in SHAPE_ONLY and any(reaches_sigmoid(o, depth+1) for o in c["outputs"]):
+                return True
+        return False
+
+    for n in d["nodes"]:
+        if n["op"]!="QLinearConv" or len(n["inputs"])<8: continue
+        zp_name=n["inputs"][7]; zt=T.get(zp_name,{})
+        v=zt.get("value")
+        if not (isinstance(v,list) and len(v)==1 and v[0]==127 and zt.get("dtype")=="int8"): continue
+        readers=cons.get(n["outputs"][0],[])
+        if not readers or any(r["op"]!="DequantizeLinear" or len(r["inputs"])<3
+                              or r["inputs"][2]!=zp_name for r in readers): continue
+        # the zero point tensor must belong to this conv and its Dequantizes alone
+        if any(u is not n and u not in readers for u in cons.get(zp_name,[])): continue
+        if not any(reaches_sigmoid(r["outputs"][0]) for r in readers): continue
+        zt["value"]=[0]
+        widened+=1
+    return widened
+
 def topo_sort(d):
     prod={o:n for n in d["nodes"] for o in n["outputs"]}
     seen=set(); order=[]
@@ -224,6 +279,8 @@ def topo_sort(d):
 
 def main(inp,out):
     d=json.load(open(inp,encoding="utf-8"))
+    n_logit=widen_logit_range(d)
+    print(f"[fuse] class-logit convs given their positive range back = {n_logit}")
     n_silu=fuse_silu(d)
     # fuse_silu already applies/omits the Q-absorption per FUSE_SILU_QUANTIZE.
     print(f"[fuse] SiLU={n_silu}"

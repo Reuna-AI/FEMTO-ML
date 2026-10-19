@@ -76,10 +76,18 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
         h.write(f"#ifndef DEBUG_DUMP\n#define DEBUG_DUMP {1 if (target=='esp32s3' and dump) else 0}\n#endif\n")
         h.write(f"#ifndef DUMP_N\n#define DUMP_N {dump_n}\n#endif\n")
         h.write("#ifndef MODEL_DEBUG\n#define MODEL_DEBUG %d\n#endif\n" % (1 if debug else 0))
+        # FEMTO_PROFILE=1 (a -D flag, nothing regenerated): time every node with
+        # femto_profile.c and report by op type and slowest node.
+        h.write("#ifndef FEMTO_PROFILE\n#define FEMTO_PROFILE 0\n#endif\n")
         h.write("#if MODEL_DEBUG\n  #include <stdio.h>\n")
         h.write("  #define DBG_NODE(i,op,name) printf(\"[%d] %s %s\\n\",(i),(op),(name))\n")
         h.write("  #define DBG_STAT(name,ptr,n,isf) dbg_stat((name),(ptr),(n),(isf))\n")
-        h.write("#else\n  #define DBG_NODE(i,op,name)\n  #define DBG_STAT(name,ptr,n,isf)\n#endif\n")
+        h.write("  #define DBG_END()\n")
+        h.write("#elif FEMTO_PROFILE\n  #include \"femto_profile.h\"\n")
+        h.write("  #define DBG_NODE(i,op,name) femto_prof_node((i),(op),(name))\n")
+        h.write("  #define DBG_STAT(name,ptr,n,isf)\n")
+        h.write("  #define DBG_END() femto_prof_end()\n")
+        h.write("#else\n  #define DBG_NODE(i,op,name)\n  #define DBG_STAT(name,ptr,n,isf)\n  #define DBG_END()\n#endif\n")
         h.write("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
         for line in ctx.header: h.write(line+"\n")
         h.write("\nvoid run_model(void);\n")
@@ -220,7 +228,7 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
                     allt=data_ins+list(outs)
                     exprs=[buf_ref(ctx,t) for t in allt][:len(names)]
                 c.write(f'  TRACE("{node["name"]}");\n  {fn}({", ".join(exprs)});\n'); c.write(dump_call(node))
-        c.write("}\n")
+        c.write("  DBG_END();\n}\n")
 
     n_ok=len(d["nodes"])-sum(skipped.values())
     print(f"codegen[{target}] -> {out_base}.c/.h : {n_ok} ops emitted")

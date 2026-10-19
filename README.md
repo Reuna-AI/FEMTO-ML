@@ -226,11 +226,13 @@ Measured on **ESP32-S3** (validated targets):
 |----------|---------------------------|-------------------------|----------|
 | YOLOv5n  | ~24 s                     | ~5 s                    | ~5×      |
 
-Once convolutions are on the SIMD path, most of the compute is already accelerated, so
-further op-level optimizations (SiLU+Quantize fusion, depthwise SIMD, arena placement) change
-total runtime only marginally (~1%). **After SIMD, the most effective remaining lever is input
-resolution** — a smaller input (e.g. 192×192 or 160×160) reduces MACs quadratically and is a
-model re-export rather than a compiler change. See [`docs/`](docs/) for the full breakdown.
+The SIMD path is only as fast as its operands arrive: on the S3, PSRAM and flash are read
+through a 32 KB data cache, so the convs run in blocks of output channels whose filters fit in
+a buffer of internal SRAM (`esp_nn_conv_s8_simd_set_fast_buf()`), instead of streaming a
+layer's filters from PSRAM for every output pixel. Build with `-D FEMTO_PROFILE=1` and call
+`femto_prof_report()` to see where each run's time goes, node by node. Input resolution
+(e.g. 192×192 or 160×160) cuts MACs quadratically on top, as a model re-export rather than a
+compiler change. See [`docs/`](docs/) for the full breakdown.
 
 ---
 

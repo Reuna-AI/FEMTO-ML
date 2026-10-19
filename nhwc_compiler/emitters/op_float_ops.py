@@ -94,7 +94,14 @@ def emit_q(ctx,node):
     else:
         zref=(wsan(z)+"[0]") if z is not None else "0"
         b.append(f"  const float s={wsan(s)}[0]; const int z={zref};")
-    b.append(f"  for(int i=0;i<{n};++i){{ int r=(int)lroundf(x[i]/s)+z;")
+    # One multiply by 1/s and an inline round half away from zero (lroundf's rule),
+    # rather than a float divide and a libm call per element: this is the commonest op
+    # in a QDQ graph (every conv input), and on an FPU without a divider each divide is
+    # a long instruction sequence. v is clamped first so the int conversion is defined.
+    b.append(f"  const float inv=1.0f/s;")
+    b.append(f"  for(int i=0;i<{n};++i){{ float v=x[i]*inv;")
+    b.append(f"    v = v<-512.0f ? -512.0f : (v>512.0f ? 512.0f : v);")
+    b.append(f"    int r=(int)(v<0.0f ? v-0.5f : v+0.5f)+z;")
     b.append(f"    if(r<-128)r=-128; if(r>127)r=127; y[i]=(signed char)r; }}")
     b.append("}"); b.append("")
     ctx.calls.append((node,fn,["x","y"]))
@@ -777,6 +784,38 @@ def emit_topk(ctx, node):
     b.append(f"// TopK {node['name']} axis={axis} K={K} ad={ad} outer={outer} (largest,sorted)")
     b.append(sig+" {")
     b.append(f"  const int OUTER={outer}, AD={ad}, K={K};")
+    if ad >= K:
+        # A K-entry heap, worst at the root: one pass over AD, K*log K to sort,
+        # instead of K passes over AD (YOLO26's class TopK: 24000 x 300). Ranked
+        # exactly as repeated max ranks: higher value first, a tie to the lower index.
+        b.append(f"  static float hv[{K}]; static int32_t hi[{K}];")
+        b.append(f"  #define TK_WORSE(i,j) (hv[i]<hv[j] || (hv[i]==hv[j] && hi[i]>hi[j]))")
+        b.append(f"  for(int o=0;o<OUTER;++o){{")
+        b.append(f"    const {ct}* xo=x+o*AD; int n=0;")
+        b.append(f"    for(int a=0;a<AD;++a){{ float v=(float)xo[a];")
+        b.append(f"      if(n<K){{ int c=n++; hv[c]=v; hi[c]=a;")
+        b.append(f"        while(c>0){{ int p=(c-1)/2; if(!TK_WORSE(c,p)) break;")
+        b.append(f"          float tv=hv[c]; hv[c]=hv[p]; hv[p]=tv; int32_t ti=hi[c]; hi[c]=hi[p]; hi[p]=ti; c=p; }}")
+        b.append(f"        continue; }}")
+        b.append(f"      if(!(v>hv[0])) continue;   /* a tie loses: its index is higher */")
+        b.append(f"      hv[0]=v; hi[0]=a; int c=0;")
+        b.append(f"      for(;;){{ int l=2*c+1, r=l+1, m=c;")
+        b.append(f"        if(l<K && TK_WORSE(l,m)) m=l; if(r<K && TK_WORSE(r,m)) m=r; if(m==c) break;")
+        b.append(f"        float tv=hv[c]; hv[c]=hv[m]; hv[m]=tv; int32_t ti=hi[c]; hi[c]=hi[m]; hi[m]=ti; c=m; }}")
+        b.append(f"    }}")
+        b.append(f"    /* pop the worst into the last place, K times: best first */")
+        b.append(f"    for(int last=K-1; last>=0; --last){{")
+        b.append(f"      vals[o*K+last]=hv[0]; idx[o*K+last]=hi[0];")
+        b.append(f"      hv[0]=hv[last]; hi[0]=hi[last]; int c=0;")
+        b.append(f"      for(;;){{ int l=2*c+1, r=l+1, m=c;")
+        b.append(f"        if(l<last && TK_WORSE(l,m)) m=l; if(r<last && TK_WORSE(r,m)) m=r; if(m==c) break;")
+        b.append(f"        float tv=hv[c]; hv[c]=hv[m]; hv[m]=tv; int32_t ti=hi[c]; hi[c]=hi[m]; hi[m]=ti; c=m; }}")
+        b.append(f"    }}")
+        b.append(f"  }}")
+        b.append(f"  #undef TK_WORSE")
+        b.append("}"); b.append("")
+        ctx.calls.append((node, fn, [x, vals_out, idx_out]))
+        return
     b.append(f"  for(int o=0;o<OUTER;++o){{")
     b.append(f"    /* simple selection of top-K by repeated max (K<<AD) */")
     b.append(f"    static char used[{ad}];")
