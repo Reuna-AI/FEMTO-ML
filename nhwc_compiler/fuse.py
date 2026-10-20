@@ -413,8 +413,9 @@ def sigmoid_through_layout(d):
                 stack.extend(_data_inputs(p))
             else:
                 fine = False
-            # nothing else may read what is about to become a sigmoid
-            if fine and len(cons.get(t, [])) != 1:
+            # nothing else may read what is about to become a sigmoid (the graph's
+            # caller included)
+            if fine and (len(cons.get(t, [])) != 1 or t in d.get("outputs", [])):
                 fine = False
         if not fine or not sources:
             continue
@@ -467,12 +468,312 @@ def fold_quantize_into_producer(d):
     return folded
 
 
+def _concat_axis(d, n):
+    """A Concat's axis as a non-negative number, or None if its shapes do not resolve."""
+    sh = d["tensors"].get(n["outputs"][0], {}).get("shape") or []
+    ax = n["attrs"].get("axis", 0)
+    if not sh or not -len(sh) <= ax < len(sh):
+        return None
+    return ax + len(sh) if ax < 0 else ax
+
+
+def cancel_layout_transposes(d):
+    """Two transposes that undo each other, with only data movement between them, both go.
+
+    A detector head (YOLO26n's) takes each scale's NHWC conv output to NCHW
+    (Transpose [0,3,1,2] + Reshape to [N,C,H*W]), concatenates the scales along H*W,
+    adds the boxes along C, and then transposes the lot back ([0,2,1]) and splits it
+    into boxes and scores again. Here every [N,C,L] tensor on that path is followed
+    as "the transpose of an [N,L,C] one we already have": an NHWC tensor read as
+    [N,H*W,C] is that already, a Concat along L of such tensors is a Concat along L
+    of theirs, an identity Sigmoid changes nothing, and the final [0,2,1] Transpose
+    is the [N,L,C] tensor itself. A Split that cuts a Concat back into the pieces it
+    was made of is those pieces. The values are only moved, never computed: the same
+    bytes, without the transposes and the float copies between them.
+
+    Model-agnostic (op types and shapes only); nothing changes in a graph without
+    the pattern. Returns how many transposes went."""
+    T = d["tensors"]
+    prod, cons = build_maps(d)
+    outputs = set(d.get("outputs", []))
+    shape = lambda t: T.get(t, {}).get("shape") or []
+    tposed = {}          # rank-3 [N,C,L] tensor -> a tensor holding it as [N,L,C]
+    rename = {}          # tensor -> the tensor its readers take instead
+    new = []             # (node to insert after, new node)
+
+    def resolve(t):
+        while t in rename:
+            t = rename[t]
+        return t
+
+    def tensor(name, shp, like):
+        base, k = name, 1
+        while name in T:                 # one tensor per new node, whatever reads it
+            k += 1; name = f"{base}{k}"
+        T[name] = {"shape": list(shp), "dtype": T[like]["dtype"], "kind": "activation",
+                   "layout": "nchw", "const_file": False}
+        for k in ("q_scale", "q_zp"):
+            if k in T[like]:
+                T[name][k] = T[like][k]
+        return name
+
+    def plain(n):
+        return not n["attrs"].get("also_q") and len(n["outputs"]) >= 1
+
+    def same_values(a, b):
+        """a can stand in for b: same type, and for int8 the same quantization."""
+        ta, tb = T.get(a, {}), T.get(b, {})
+        return ta.get("dtype") == tb.get("dtype") and \
+            (ta.get("q_scale"), ta.get("q_zp")) == (tb.get("q_scale"), tb.get("q_zp"))
+
+    for n in list(d["nodes"]):
+        op = n["op"]
+        if op == "Reshape" and plain(n):
+            t = n["inputs"][0]; p = prod.get(t); y = n["outputs"][0]
+            if p is None or p["op"] != "Transpose" or p["attrs"].get("perm") != [0, 3, 1, 2]:
+                continue
+            x = p["inputs"][0]; xs = shape(x); ys = shape(y)
+            if len(xs) != 4 or ys != [xs[0], xs[3], xs[1] * xs[2]]:
+                continue
+            v = tensor(x + "_as_nlc", [xs[0], xs[1] * xs[2], xs[3]], x)
+            new.append((n, {"name": v, "op": "Reshape", "inputs": [x], "outputs": [v], "attrs": {}}))
+            tposed[y] = v
+
+        elif op == "Concat" and plain(n):
+            y = n["outputs"][0]; ys = shape(y); ax = _concat_axis(d, n)
+            ins = [resolve(i) for i in n["inputs"]]
+            if len(ys) != 3 or ax is None:
+                continue
+            if ax == 2 and all(i in tposed for i in ins):
+                parts = [tposed[i] for i in ins]
+                c = tensor(y + "_as_nlc", [ys[0], ys[2], ys[1]], parts[0])
+                new.append((n, {"name": c, "op": "Concat", "inputs": parts, "outputs": [c],
+                                "attrs": {"axis": 1}}))
+                tposed[y] = c
+            elif ax == 1 and any(i in tposed for i in ins) and cons.get(y) and \
+                    all(r["op"] == "Transpose" and r["attrs"].get("perm") == [0, 2, 1] for r in cons[y]):
+                parts = []
+                for i in ins:
+                    if i in tposed:
+                        parts.append(tposed[i]); continue
+                    s = shape(i)
+                    u = tensor(i + "_as_nlc", [s[0], s[2], s[1]], i)
+                    new.append((n, {"name": u, "op": "Transpose", "inputs": [i], "outputs": [u],
+                                    "attrs": {"perm": [0, 2, 1]}}))
+                    parts.append(u)
+                c = tensor(y + "_as_nlc", [ys[0], ys[2], ys[1]], parts[0])
+                new.append((n, {"name": c, "op": "Concat", "inputs": parts, "outputs": [c],
+                                "attrs": {"axis": 2}}))
+                tposed[y] = c
+
+        elif op == "Sigmoid" and n["attrs"].get("identity"):
+            x = resolve(n["inputs"][0])
+            if x in tposed:
+                tposed[n["outputs"][0]] = tposed[x]
+
+        elif op == "Transpose" and n["attrs"].get("perm") == [0, 2, 1]:
+            x = resolve(n["inputs"][0]); y = n["outputs"][0]
+            if x in tposed and y not in outputs and same_values(tposed[x], y) \
+                    and shape(tposed[x]) == shape(y):
+                rename[y] = tposed[x]
+
+        elif op == "Split" and plain(n):
+            x = resolve(n["inputs"][0]); xs = shape(x)
+            c = prod.get(x) or next((m for _, m in new if m["outputs"][0] == x), None)
+            if c is None or c["op"] != "Concat" or c["attrs"].get("also_q") or not xs:
+                continue
+            ax = n["attrs"].get("axis", 0); ax = ax + len(xs) if ax < 0 else ax
+            cx = c["attrs"].get("axis", 0); cx = cx + len(xs) if cx < 0 else cx
+            parts = c["inputs"]; outs = n["outputs"]
+            if ax != cx or len(parts) != len(outs) or any(o in outputs for o in outs):
+                continue
+            if all(shape(p) and shape(p) == shape(o) and same_values(p, o) for p, o in zip(parts, outs)):
+                for p, o in zip(parts, outs):
+                    rename[o] = p
+
+    if not rename:
+        return 0
+    # the new nodes go in just before the node that made them needed
+    order = []
+    after = {}
+    for anchor, m in new:
+        after.setdefault(id(anchor), []).append(m)
+    for n in d["nodes"]:
+        order.extend(after.get(id(n), []))
+        order.append(n)
+    for n in order:
+        n["inputs"] = [resolve(i) for i in n["inputs"]]
+    d["nodes"] = order
+    # what nobody reads any more goes, but only nodes that only move values
+    gone = 0
+    movers = ("Transpose", "Reshape", "Concat", "Split", "Sigmoid", "Flatten", "Unsqueeze")
+    while True:
+        prod, cons = build_maps(d)
+        dead = [n for n in d["nodes"] if n["op"] in movers and plain(n)
+                and (n["op"] != "Sigmoid" or n["attrs"].get("identity"))
+                and not any(cons.get(o) or o in outputs for o in n["outputs"])]
+        if not dead:
+            break
+        gone += sum(1 for n in dead if n["op"] == "Transpose")
+        ids = {id(n) for n in dead}
+        d["nodes"] = [n for n in d["nodes"] if id(n) not in ids]
+    added = sum(1 for _, m in new if m["op"] == "Transpose" and any(m is n for n in d["nodes"]))
+    return gone - added
+
+
+LAZY_FLOATS = True
+LAZY_DEPTH = 4          # how many ops deep a value may be recomputed where it is read
+
+def _last_axis(n, rank):
+    ax = n["attrs"].get("axis", 0)
+    ax = ax + rank if ax < 0 else ax
+    return ax == rank - 1
+
+
+def mark_lazy_floats(d):
+    """Float tensors that are cheaper to recompute where they are read than to store.
+
+    In a C2f block a SiLU table turns an int8 conv output into floats, a Split cuts them
+    in two, a residual Add sums one half with another SiLU's floats, and a Concat
+    quantizes all three for the next conv. Every one of those floats is a table entry
+    (or a dequantized byte, or a sum of two such), so it can be made again from the
+    int8 it came from, at the moment it is needed, instead of being written to PSRAM
+    at 4 bytes a value and read back. Such a tensor is marked "lazy": it gets no
+    memory, the ops that made it only to store it are not emitted, and the ops that
+    read it (Split, Add, Concat along the channels) compute it in their own loop, by
+    the same C expression its producer used -- so the same float, to the bit.
+
+    A tensor is lazy when its producer is a float SiLU table, a plain
+    DequantizeLinear, a channel Split or a same-shape Add, and every reader is a
+    channel Split, a same-shape Add or a float channel Concat. The int8 tensors a lazy
+    one is made from are listed in its readers' "reads", so the arena keeps them
+    alive until then. Returns how many tensors went lazy."""
+    if not LAZY_FLOATS:
+        return 0
+    T = d["tensors"]
+    prod, cons = build_maps(d)
+    outputs = set(d.get("outputs", []))
+    shape = lambda t: T.get(t, {}).get("shape") or []
+    def isq(t):
+        m = T.get(t, {})
+        return m.get("dtype") == "int8" and m.get("q_scale") is not None
+    def flt(t):
+        return T.get(t, {}).get("dtype") == "float32" and t in prod and T[t].get("kind") != "init"
+    def act(t):
+        return t in prod and T.get(t, {}).get("kind") != "init" and T[t].get("value") is None
+
+    def add_ok(n):
+        a, b = n["inputs"][0], n["inputs"][1]; y = n["outputs"][0]
+        if not (act(a) and act(b)) or T[b].get("const_file") or not shape(y):
+            return False
+        if not (shape(a) == shape(b) == shape(y)):
+            return False
+        return all(flt(i) or isq(i) for i in (a, b))
+
+    def split_ok(n):
+        x = n["inputs"][0]
+        return flt(x) and len(shape(x)) >= 2 and _last_axis(n, len(shape(x)))
+
+    def concat_ok(n):
+        y = n["outputs"][0]; ys = shape(y)
+        if T.get(y, {}).get("dtype") != "float32" or not ys or not _last_axis(n, len(ys)):
+            return False
+        return all(shape(i)[:-1] == ys[:-1] for i in n["inputs"])
+
+    def resize_ok(n):
+        x = n["inputs"][0]; y = n["outputs"][0]
+        return (n["attrs"].get("mode", "nearest") == "nearest" and flt(x) and len(shape(x)) == 4
+                and len(shape(y)) == 4 and shape(x)[3] == shape(y)[3] and shape(x)[0] == shape(y)[0] == 1)
+
+    def reader_ok(n, t):
+        if n["op"] == "Resize": return resize_ok(n) and n["outputs"][0] in lazy
+        if n["op"] == "Split": return split_ok(n) and n["inputs"][0] == t
+        if n["op"] == "Add": return add_ok(n) and t in n["inputs"][:2]
+        if n["op"] == "Concat": return concat_ok(n)
+        return False
+
+    def producer_ok(t):
+        p = prod.get(t)
+        if p is None or not flt(t) or t in outputs:
+            return False
+        if t in {e["dst"] for e in p["attrs"].get("also_q", [])}:
+            return False
+        if p["op"] == "SiLU":
+            return "out_scale" not in p["attrs"] and T.get(p["inputs"][0], {}).get("dtype") == "int8"
+        if p["op"] == "DequantizeLinear":
+            return not p["attrs"].get("then_sigmoid") and _qparams(d, {"inputs": p["inputs"]}) is not None
+        if p["op"] == "Split":
+            return split_ok(p)
+        if p["op"] == "Add":
+            # float inputs only: an int8 one is dequantized inline (s*q), and a reader
+            # computing s*q+b itself could see the compiler fuse that into one
+            # multiply-add (Xtensa madd.s), rounding differently from the stored sum
+            return add_ok(p) and all(flt(i) for i in p["inputs"][:2])
+        if p["op"] == "Resize":
+            return resize_ok(p)
+        return False
+
+    def depth(t):
+        if t not in lazy:
+            return 0
+        p = prod[t]
+        ins = p["inputs"][:2] if p["op"] == "Add" else p["inputs"][:1]
+        return 1 + max(depth(i) for i in ins)
+
+    # the largest set in which every lazy tensor's readers can make it themselves,
+    # and none is more than LAZY_DEPTH ops of recomputation deep
+    lazy = {t for t in list(T) if producer_ok(t) and cons.get(t)}
+    while True:
+        drop = {t for t in lazy if not all(reader_ok(n, t) for n in cons[t])}
+        if not drop:
+            deep = [t for t in lazy if depth(t) > LAZY_DEPTH]
+            if not deep:
+                break
+            drop = {max(deep, key=depth)}
+        lazy -= drop
+
+    def sources(t):
+        if t not in lazy:
+            return [t]
+        p = prod[t]
+        ins = p["inputs"][:2] if p["op"] == "Add" else p["inputs"][:1]
+        out = []
+        for i in ins:
+            for s in sources(i):
+                if s not in out:
+                    out.append(s)
+        return out
+
+    for t in lazy:
+        p = prod[t]
+        T[t]["lazy"] = {"node": {"name": p["name"], "op": p["op"], "inputs": list(p["inputs"]),
+                                 "outputs": list(p["outputs"]), "attrs": dict(p["attrs"])}}
+    for n in d["nodes"]:
+        reads = []
+        for i in n["inputs"]:
+            if i in lazy:
+                for s in sources(i):
+                    if s not in reads:
+                        reads.append(s)
+        if reads:
+            n["reads"] = reads
+    # an op whose every output went lazy, with nothing folded into it, is not emitted
+    keep = []
+    for n in d["nodes"]:
+        main = [o for o in n["outputs"] if o not in {e["dst"] for e in n["attrs"].get("also_q", [])}]
+        if main and all(o in lazy for o in main) and not n["attrs"].get("also_q"):
+            continue
+        keep.append(n)
+    d["nodes"] = keep
+    return len(lazy)
+
+
 def topo_sort(d):
     prod={o:n for n in d["nodes"] for o in n["outputs"]}
     seen=set(); order=[]
     def visit(n, stack):
         if id(n) in seen: return
-        for i in n["inputs"]:
+        for i in list(n["inputs"])+list(n.get("reads",[])):
             p=prod.get(i)
             if p and id(p) not in seen and id(p) not in stack:
                 visit(p, stack|{id(n)})
@@ -498,6 +799,10 @@ def main(inp,out):
     if INT8_LAYOUT:
         n_fold = fold_quantize_into_producer(d)
         print(f"[fuse] QuantizeLinears folded into their producers = {n_fold}")
+    n_tr = cancel_layout_transposes(d)
+    print(f"[fuse] transposes that undid each other, gone = {n_tr}")
+    n_lazy = mark_lazy_floats(d)
+    print(f"[fuse] float tensors made again where read instead of stored = {n_lazy}")
     topo_sort(d)
     json.dump(d, open(out,"w",encoding="utf-8"), indent=1, ensure_ascii=False)
     print(f"fuse -> {out}: SiLU fused = {n_silu}, nodes now {len(d['nodes'])}")

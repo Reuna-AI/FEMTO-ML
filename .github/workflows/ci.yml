@@ -20,3 +20,32 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
+
+  tests:
+    # The compiler's output, built and run on the runner: the conv kernels against
+    # their C reference, the shipped YOLO26n against its golden outputs, and small
+    # models of other shapes against onnxruntime.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy onnx onnxruntime
+      - name: Conv kernels, bit for bit (C reference paths, then the S3 paths emulated)
+        run: |
+          gcc -O2 -I examples/esp32_yolo26n tools/test_conv_kernels.c examples/esp32_yolo26n/esp_nn_conv_s8_simd.c -lm -o test_conv_ref
+          ./test_conv_ref
+          gcc -O2 -DESP_NN_S3_EMULATE -I examples/esp32_yolo26n tools/test_conv_kernels.c examples/esp32_yolo26n/esp_nn_conv_s8_simd.c -lm -o test_conv_s3
+          ./test_conv_s3
+      - name: YOLO26n golden outputs (esp32s3 and ansi_int8)
+        run: python tools/test_golden.py
+      - name: The same, with multiply-add fusion on (as the board's compiler builds)
+        run: FEMTO_CFLAGS="-mfma -ffp-contract=fast" python tools/test_golden.py
+      - name: Op cases against onnxruntime
+        run: python tools/test_ops.py
+      - name: Scorecard
+        run: python tools/femto_bench.py examples/esp32_yolo26n/yolo26n_q.onnx

@@ -170,7 +170,9 @@ regeneration from ONNX:
 
 | Directive             | File                 | Default | Meaning                                             |
 |-----------------------|----------------------|---------|-----------------------------------------------------|
-| `FUSE_SILU_QUANTIZE`  | `fuse.py`            | `False` | Fold post-SiLU Quantize into an int8 SiLU LUT       |
+| `FUSE_SILU_QUANTIZE`  | `fuse.py`            | `True`  | Fold post-SiLU Quantize into an int8 SiLU LUT       |
+| `INT8_LAYOUT`         | `fuse.py`            | `True`  | Quantize where a value is made, move int8 after     |
+| `LAZY_FLOATS`         | `fuse.py`            | `True`  | Make table-derived floats again where read, unstored|
 | `SRAM_BUDGET_BYTES`   | `gen_activations.py` | 128 KiB | Fast-RAM budget for the hybrid arena (experimental) |
 | `SRAM_PRIORITY`       | `gen_activations.py` | `"hot"` | `"hot"` (most-accessed) or `"large"` (biggest-first)|
 
@@ -202,6 +204,18 @@ python tools/compare_fuse_modes.py capture --mode false --port <PORT> --out dump
 python tools/compare_fuse_modes.py capture --mode true  --port <PORT> --out dump_true.txt
 python tools/compare_fuse_modes.py compare --true dump_true.txt --false dump_false.txt
 ```
+
+## Testing on a PC
+
+No board needed: the generated C is built with gcc and run (CI runs all three):
+```bash
+python tools/test_golden.py      # YOLO26n gives exactly its recorded outputs (esp32s3 and ansi_int8)
+python tools/test_ops.py         # small models of other shapes against onnxruntime
+python tools/femto_bench.py examples/esp32_yolo26n/yolo26n_q.onnx   # memory and traffic scorecard
+```
+A compiler change that should not change results must leave `test_golden.py` passing. One
+that should (a better rounding, say) is checked against onnxruntime first, then recorded
+with `python tools/test_golden.py --update` and explained in CHANGELOG.md.
 
 ## Inspecting the graph
 

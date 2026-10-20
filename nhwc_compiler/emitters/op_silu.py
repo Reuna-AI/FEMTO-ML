@@ -109,17 +109,18 @@ def emit(ctx, node):
         extra=also_q(node)
         if extra:
             # and the QuantizeLinears after it, in the same pass (fuse.py fold_quantize_into_producer)
-            sig=f"void {fn}(const int8_t* x, float* y" + "".join(f", int8_t* q{k}" for k in range(len(extra))) + ")"
+            lazy_y = bool(ctx.T.get(y, {}).get("lazy"))   # floats made again where read: only the int8 here
+            sig=f"void {fn}(const int8_t* x" + ("" if lazy_y else ", float* y") + "".join(f", int8_t* q{k}" for k in range(len(extra))) + ")"
             h.append(sig+";")
             b.append(f"// SiLU {node['name']}  n={n}  in=({is_:.6g},{iz})  int8->float, and int8 for {len(extra)} QuantizeLinear(s)")
             b.append(sig+" {")
             b.append(f"  static const float lut[256]={{{tbl}}};")
             b.append("  " + also_q_consts(extra))
-            keep = "" if all(e.get("float_dead") for e in extra) else "y[i]=v; "
+            keep = "" if lazy_y or all(e.get("float_dead") for e in extra) else "y[i]=v; "
             b.append(f"  for(int i=0;i<{n};++i){{ float v=lut[(unsigned char)(x[i]+128)]; {keep}" + also_q_stores(extra, "v", "i") + " }")
             b.append("}"); b.append("")
             if y in ctx.T: ctx.T[y]["dtype"]="float32"
-            ctx.calls.append((node, fn, [x, y] + [e["dst"] for e in extra]))
+            ctx.calls.append((node, fn, [x] + ([] if lazy_y else [y]) + [e["dst"] for e in extra]))
             return
         sig=f"void {fn}(const int8_t* x, float* y)"
         h.append(sig+";")

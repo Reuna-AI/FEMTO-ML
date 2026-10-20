@@ -84,3 +84,20 @@ def also_q_stores(entries, vexpr, index):
     """C storing float vexpr, quantized, into each folded QuantizeLinear's output at index."""
     return " ".join(quant_c(f"q{k}[{index}]", vexpr, inv=f"inv{k}", z=f"z{k}")
                     for k, e in enumerate(entries))
+
+def nearest_supported(a,H,W,Ho,Wo):
+    """Whether ONNX nearest Resize with these attributes picks source pixel
+    floor(o*in/out), the one rule the emitter (and fuse.py's lazy Resize) computes.
+    True for whole-number upscales under the modes exporters use; anything else
+    (align_corners, fractional scales, ...) is refused rather than computed wrong."""
+    ctm=a.get("coordinate_transformation_mode","half_pixel")
+    nm=a.get("nearest_mode","round_prefer_floor")
+    if Ho%H or Wo%W:
+        return False
+    if ctm=="asymmetric":
+        # source o*in/out exactly: floor, or rounding with ties down, which is floor
+        # only while the scale is at most 2 (at 3, o=2 rounds to 1)
+        return nm=="floor" or (nm=="round_prefer_floor" and Ho//H<=2 and Wo//W<=2)
+    if ctm in ("half_pixel","pytorch_half_pixel"):
+        return nm in ("round_prefer_floor","round_prefer_ceil")
+    return False

@@ -183,6 +183,7 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
                 nm=node["name"]
                 if not any(sub in nm for sub in dump_nodes): return ""
             o=outs[0]; t=ctx.T.get(o,{}); sh=t.get("shape",[])
+            if t.get("lazy"): return ""      # not stored: made again where it is read
             dt=t.get("dtype","int8"); ref=buf_ref(ctx,o)
             def _numel(dd):
                 n=1
@@ -267,8 +268,9 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
     n_ok=len(d["nodes"])-sum(skipped.values())
     print(f"codegen[{target}] -> {out_base}.c/.h : {n_ok} ops emitted")
     if skipped:
-        print("  UNHANDLED ops (need emitters/op_*.py):")
-        for op,cnt in sorted(skipped.items()): print(f"    {op}: {cnt}")
+        # C without these ops would compile and give wrong answers: stop instead.
+        raise SystemExit("codegen: no emitter for " + ", ".join(f"{op} x{cnt}" for op,cnt in sorted(skipped.items()))
+                         + " (add one in emitters/op_*.py)")
 
 if __name__=="__main__":
     ap=argparse.ArgumentParser()

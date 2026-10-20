@@ -47,6 +47,13 @@ ONNX_DT = {1:"float32",2:"uint8",3:"int8",6:"int32",7:"int64",9:"bool",10:"float
 # ---------------- Stage 1a: ONNX -> JSON (verbatim, NCHW) ----------------
 def build(onnx_path, out_json):
     m = onnx.load(onnx_path); g = m.graph
+    # Every emitter needs its tensors' shapes. A model saved without them (most
+    # quantizer outputs) gets ONNX's own shape inference first, rather than the
+    # QLinearConv emitter failing on an empty shape.
+    known = {vi.name for vi in list(g.input) + list(g.output) + list(g.value_info)}
+    known |= {it.name for it in g.initializer}
+    if any(o and o not in known for n in g.node if n.op_type != "Constant" for o in n.output):
+        m = onnx.shape_inference.infer_shapes(m); g = m.graph
     tensors = {}
     def dt(elem): return ONNX_DT.get(elem, f"elem{elem}")
     NP2={"int8":"int8","uint8":"uint8","int32":"int32","int64":"int64",
@@ -174,6 +181,13 @@ def nhwc_pass(in_json, out_json):
     def ensure(name, want):
         cur=state.get(name,"nchw")
         if cur in ("const","none",want): return name
+        # Only a 4-D tensor has an NCHW or NHWC layout. A tensor known to have another
+        # rank is the same bytes either way: relabel it instead of inserting a 4-D
+        # Transpose its emitter could only turn into a copy. (An unknown shape keeps the
+        # Transpose, and the Transpose emitter stops the build.)
+        sh=T.get(name,{}).get("shape") or []
+        if sh and len(sh)!=4 and all(isinstance(v,int) and v>=0 for v in sh):
+            state[name]=want; return name
         if cur=="nchw" and want=="nhwc": return add_transpose(name,[0,2,3,1],"nhwc")
         if cur=="nhwc" and want=="nchw": return add_transpose(name,[0,3,1,2],"nchw")
         return name

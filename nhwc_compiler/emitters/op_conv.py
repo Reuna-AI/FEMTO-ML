@@ -342,7 +342,7 @@ def _body_ansi_float(XS,XZ,YS,YZ):
           accf+=xf*wf;
         }}
       }}}}
-    if(bias) accf+=YS*0; // bias handled in int domain normally; float path is reference-only
+    if(bias) accf+=(float)bias[k]*mult[k]*YS;  // the int32 bias is at scale XS*w_scale[k]
     int r=(int)lroundf(accf/YS)+YZ; if(r<-128)r=-128; if(r>127)r=127;
     y[(oh*Wo+ow)*K+k]=(signed char)r;
   }}"""
