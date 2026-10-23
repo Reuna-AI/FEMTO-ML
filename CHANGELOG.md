@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output rows. Before its first use it checks itself against the reference on five small
   layers and, if it ever disagrees, is never used (the old paths run as before);
   `esp_nn_depthwise_conv_s8_simd_self_check()` says which.
+- Measured on the board (ESP32-S3, 23 October 2026; the check passed): the YuNet face finder,
+  as the JARVIS house cam times it in normal use, 1838 -> 1319 ms (1012 ms with nothing else
+  talking to the board, as the other core is then free); YOLO26n about 2.2 -> 2.0 s, its
+  depthwise layers (68 and 48 ms the slowest before) now under 28 ms each.
 - The convs' second-core worker runs any function handed to it (`esp_nn_simd_both_cores()`),
   so the depthwise conv shares it; `esp_nn_conv_s8_simd_cores()` and
   `esp_nn_conv_s8_simd_borrow_fast_buf()` are new.
