@@ -47,5 +47,7 @@ jobs:
         run: FEMTO_CFLAGS="-mfma -ffp-contract=fast" python tools/test_golden.py
       - name: Op cases against onnxruntime
         run: python tools/test_ops.py
+      - name: Two models in one program (--prefix), and the int8 input alone
+        run: python tools/test_two_models.py
       - name: Scorecard
         run: python tools/femto_bench.py examples/esp32_yolo26n/yolo26n_q.onnx

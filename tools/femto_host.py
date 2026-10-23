@@ -38,10 +38,12 @@ def _san(n):
     return "tensor_" + "".join(c if c.isalnum() else "_" for c in n)
 
 
-def compile_model(onnx_path, out, target="esp32s3", sram=0, quiet=True):
-    """The six stages, then gcc. Returns out (holding run, io.json and the sources)."""
+def compile_model(onnx_path, out, target="esp32s3", sram=0, quiet=True, prefix="", gcc=True):
+    """The six stages, then gcc. Returns out (holding run, io.json and the sources). With [prefix],
+    the model's names and files are prefixed (prefix.py), as for a second model in one firmware;
+    without [gcc], only the sources are made."""
     sys.path.insert(0, COMPILER)
-    import graph_json, fuse, gen_weights, gen_activations, codegen
+    import graph_json, fuse, gen_weights, gen_activations, codegen, prefix as prefixing
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
     j = lambda n: os.path.join(out, n)
@@ -56,6 +58,8 @@ def compile_model(onnx_path, out, target="esp32s3", sram=0, quiet=True):
             gen_weights.main(j("graph_fused.json"), out, 5_000_000, target)
             gen_activations.main(j("graph_fused.json"), j("activations.h"), target)
             codegen.main(j("graph_fused.json"), j("model"), target, target == "esp32s3", False)
+            if prefix:
+                prefixing.apply(out, prefix)
     finally:
         gen_activations.SRAM_BUDGET_BYTES = saved
     with open(j("build.log"), "w") as f:
@@ -64,26 +68,29 @@ def compile_model(onnx_path, out, target="esp32s3", sram=0, quiet=True):
     ins = [(n, d["tensors"][n]) for n in d["inputs"]]
     outs = [(n, d["tensors"][n]) for n in d["outputs"]]
     numel = lambda s: int(np.prod(s)) if s else 1
-    c = ['#include <stdio.h>', '#include "model.h"', 'int main(int argc,char**argv){',
-         '  if(activations_init()) return 1;',
+    p = prefix
+    c = ['#include <stdio.h>', f'#include "{p}model.h"', 'int main(int argc,char**argv){',
+         f'  if({p}activations_init()) return 1;',
          '  FILE*f=fopen(argv[1],"rb"); FILE*o=fopen(argv[2],"wb"); if(!f||!o) return 2;']
     for n, t in ins:
         nb = numel(t["shape"]) * SZ[t["dtype"]]
-        c.append(f'  if(fread((void*){_san(n)},1,{nb},f)!={nb}) return 3;')
-    c.append('  run_model();')
+        c.append(f'  if(fread((void*){p}{_san(n)},1,{nb},f)!={nb}) return 3;')
+    c.append(f'  {p}run_model();')
     for n, t in outs:
-        c.append(f'  fwrite((void*){_san(n)},1,{numel(t["shape"]) * SZ[t["dtype"]]},o);')
+        c.append(f'  fwrite((void*){p}{_san(n)},1,{numel(t["shape"]) * SZ[t["dtype"]]},o);')
     c += ['  fclose(f); fclose(o); return 0;', '}']
     open(j("host_main.c"), "w").write("\n".join(c) + "\n")
     json.dump({"inputs": [(n, t["shape"], t["dtype"]) for n, t in ins],
                "outputs": [(n, t["shape"], t["dtype"]) for n, t in outs]}, open(j("io.json"), "w"))
-    src = [j("host_main.c"), j("model.c"), j("activations.c")]
-    src += sorted(os.path.join(out, f) for f in os.listdir(out) if f.startswith("weights_") and f.endswith(".c"))
+    src = [j("host_main.c"), j(p + "model.c"), j(p + "activations.c")]
+    src += sorted(os.path.join(out, f) for f in os.listdir(out) if f.startswith(p + "weights_") and f.endswith(".c"))
     if target == "esp32s3":
         for f in os.listdir(KERNELS):
             if f.startswith(("esp_nn_", "femto_profile")) and f.endswith((".c", ".h")):
                 shutil.copy2(os.path.join(KERNELS, f), out)
         src += [j("esp_nn_conv_s8_simd.c"), j("esp_nn_depthwise_conv_s8_simd.c")]
+    if not gcc:
+        return out
     # FEMTO_CFLAGS adds flags after these, e.g. "-mfma -ffp-contract=fast" to build the
     # way the board's compiler does (it fuses a*b+c into one multiply-add by default)
     extra = os.environ.get("FEMTO_CFLAGS", "").split()

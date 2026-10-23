@@ -133,6 +133,7 @@ def _unary(op, cexpr):
         b.append("}"); b.append("")
         ctx.calls.append((node,fn,["x","y"]))
 _unary("Sigmoid","1.0f/(1.0f+expf(-v))")
+_unary("Relu","v>0.0f?v:0.0f")
 _sigmoid_float = REGISTRY["Sigmoid"]
 
 @register("Sigmoid")

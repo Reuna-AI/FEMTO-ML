@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (third round, October 2026)
+- `--prefix` (`nhwc_compiler/prefix.py`): a model's files and every name it makes visible
+  (functions, weights, arena unions and pointers, tensor macros, `MODEL_INPUT_*`) get a prefix,
+  so two models build into one firmware -- a person detector and a face finder, say. The names
+  are read from the generated headers, not from a list. `tools/test_two_models.py` builds two
+  models into one program, one source including both headers: each gives exactly the bytes it
+  gives alone; without the prefix the same program does not link.
+- `FEMTO_NO_FLOAT_INPUT`, defined when the C is compiled: the float input buffer is not
+  allocated (786 KB for YOLO26n at 256x256) for a caller that writes the int8 input itself,
+  and `run_model()` is left out so it cannot be called by mistake.
+- A `Relu` emitter: a model quantized with only its convs quantized keeps float ReLUs between
+  them (YuNet's backbone, quantized that way, stopped at "no emitter for Relu").
+
+### Fixed (third round)
+- A conv with one output channel did not build: its bias, a single value, was inlined as a
+  constant while the generated C still named a bias array that was never written (YuNet's
+  face and object scores: "undeclared w_..._bias_quantized"). A conv's bias is now always a
+  weight array.
+- `test_ops.py` has the two cases that found these: `one_channel` and `relu`.
+
+Checked with YuNet (OpenCV's face detector, MIT), quantized to int8 at 320x256 and compiled for
+esp32s3: on 186 house-camera pictures it was not tuned on, the faces found match onnxruntime's
+int8 model in 185 and the float model in 184, scores within 0.03; arena 0.9 MB. YOLO26n's
+golden outputs are unchanged on both targets.
+
 ### Changed (second round, October 2026)
 Measured with `tools/femto_bench.py` on YOLO26n (esp32s3 target), the first round's build -> this one:
 working memory 4.94 -> 3.94 MB, memory traffic per run (estimate) 46.2 -> 24.3 MB,

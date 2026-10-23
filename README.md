@@ -155,6 +155,7 @@ python nhwc_compiler/build_model.py <model_q.onnx> <outdir/> [flags]
 | `--debug`        | flag                                        | off           | Emit per-node trace prints on device                             |
 | `--name`         | string                                      | `model`       | Basename for the generated `model.c` / `model.h`                 |
 | `--keep-json`    | flag                                        | off           | Keep intermediate `.json` IR files instead of cleaning them up   |
+| `--prefix`       | C identifier, e.g. `face_`                  | none          | Prefix the files and every name the model makes visible, so two models can be built into one firmware |
 
 The `codegen.py` stage (invoked by the orchestrator, or runnable directly) additionally
 supports device‑validation flags: `--dump` (per-node activation dump over serial),
@@ -175,6 +176,11 @@ regeneration from ONNX:
 | `LAZY_FLOATS`         | `fuse.py`            | `True`  | Make table-derived floats again where read, unstored|
 | `SRAM_BUDGET_BYTES`   | `gen_activations.py` | 128 KiB | Fast-RAM budget for the hybrid arena (experimental) |
 | `SRAM_PRIORITY`       | `gen_activations.py` | `"hot"` | `"hot"` (most-accessed) or `"large"` (biggest-first)|
+
+One switch is set when the generated C is compiled, not when it is generated:
+`-DFEMTO_NO_FLOAT_INPUT` leaves the model's float input unallocated, for a caller that writes
+the int8 input itself (`model_input_int8`, then `run_model_int8_input()`); `run_model()` is then
+not defined, and a model without an int8 input entry refuses to build with it.
 
 ---
 
@@ -211,6 +217,7 @@ No board needed: the generated C is built with gcc and run (CI runs all three):
 ```bash
 python tools/test_golden.py      # YOLO26n gives exactly its recorded outputs (esp32s3 and ansi_int8)
 python tools/test_ops.py         # small models of other shapes against onnxruntime
+python tools/test_two_models.py  # two models in one program (--prefix); a model fed int8 only
 python tools/femto_bench.py examples/esp32_yolo26n/yolo26n_q.onnx   # memory and traffic scorecard
 ```
 A compiler change that should not change results must leave `test_golden.py` passing. One

@@ -92,17 +92,23 @@ def build(onnx_path, out_json):
         ("TopK",1),("Expand",1),
     }
     _meta_names=set()
+    # A conv's bias is read per output channel by the kernels, so it is always a weight array,
+    # even when the conv has one output channel and the bias one value (YuNet's class and
+    # object heads: inlined, the generated C named an array that was never written).
+    _bias_names=set()
     for _n in g.node:
         for _idx,_inp in enumerate(_n.input):
             if (_n.op_type,_idx) in META_SLOTS:
                 _meta_names.add(_inp)
+            if (_n.op_type,_idx) in (("QLinearConv",8),("Conv",2)):
+                _bias_names.add(_inp)
 
     for name,arr in const_vals.items():
         entry = {"shape":list(arr.shape), "dtype":dt2(arr.dtype),
                  "kind":"init", "layout":"none", "const_file":True}
         # inline only SMALL FLOAT/scalar consts (scales, zp). Keep bias/int arrays
         # file-backed: they are per-channel data the kernels index at runtime.
-        is_intdata = dt2(arr.dtype) in ("int32","int64") and arr.size>1
+        is_intdata = dt2(arr.dtype) in ("int32","int64") and (arr.size>1 or name in _bias_names)
         is_weightdata = dt2(arr.dtype) in ("int8","uint8") and arr.size>1   # conv weights: never inline
         # small int64/int32 metadata (split sizes, shapes) up to 8 elems: DO inline as value
         is_small_meta = (dt2(arr.dtype) in ("int32","int64") and arr.size<=8

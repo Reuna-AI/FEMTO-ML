@@ -103,7 +103,11 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
         h.write("#else\n  #define DBG_NODE(i,op,name)\n  #define DBG_STAT(name,ptr,n,isf)\n  #define DBG_END()\n#endif\n")
         h.write("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
         for line in ctx.header: h.write(line+"\n")
-        h.write("\nvoid run_model(void);\n")
+        # FEMTO_NO_FLOAT_INPUT: the float input is never allocated (activations.c), so only
+        # run_model_int8_input() can run -- and only a model that has one may be built that way.
+        h.write("\n#ifndef FEMTO_NO_FLOAT_INPUT\nvoid run_model(void);\n#endif\n")
+        if not skip_input:
+            h.write("#ifdef FEMTO_NO_FLOAT_INPUT\n#error \"this model has no int8 input to write: build it without FEMTO_NO_FLOAT_INPUT\"\n#endif\n")
         if skip_input:
             name, sc, zp = skip_input
             _,H,W,C = ctx.shape(name)
@@ -261,7 +265,7 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
                     exprs=[buf_ref(ctx,t) for t in allt][:len(names)]
                 c.write(f'  TRACE("{node["name"]}");\n  {fn}({", ".join(exprs)});\n'); c.write(dump_call(node))
         c.write("  DBG_END();\n}\n\n")
-        c.write("void run_model(void){ run_from(0); }\n")
+        c.write("#ifndef FEMTO_NO_FLOAT_INPUT\nvoid run_model(void){ run_from(0); }\n#endif\n")
         if skip_input:
             c.write("void run_model_int8_input(void){ run_from(2); }\n")
 

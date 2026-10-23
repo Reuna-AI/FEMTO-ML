@@ -383,7 +383,12 @@ def main(json_path, out_h, target="ansi_int8"):
             for j,(name,meta,ctype,inner,nbytes) in enumerate(_standalone):
                 cast=f"({ctype}(*){inner if inner else '[1]'})"
                 # standalone buffers (often large, e.g. output) -> PSRAM
+                # The float input is not needed by a caller that writes the int8 input itself
+                # (run_model_int8_input): with FEMTO_NO_FLOAT_INPUT defined it is not taken.
+                float_input = name in d["inputs"] and ctype=="float"
+                if float_input: g.write("#ifndef FEMTO_NO_FLOAT_INPUT\n")
                 g.write(f"  {san(name)}_p={cast}ARENA_ALLOC_PSRAM({nbytes}); if(!{san(name)}_p) return {base+j+1};\n")
+                if float_input: g.write("#endif\n")
             g.write("  return 0;\n}\n")
             g.write("void activations_free(void){\n")
             for ui in range(len(unions)):

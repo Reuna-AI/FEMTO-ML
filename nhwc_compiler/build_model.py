@@ -58,6 +58,8 @@ def main():
     ap.add_argument("--debug", action="store_true", help="per-node trace prints (a Serial trace on esp32s3)")
     ap.add_argument("--name", default="model", help="basename for generated model.c/.h")
     ap.add_argument("--keep-json", action="store_true", help="keep intermediate .json files")
+    ap.add_argument("--prefix", default="", help="prefix every name and file the model makes visible "
+                    "(e.g. face_), so two models can be built into one firmware (prefix.py)")
     a=ap.parse_args()
 
     if not os.path.isfile(a.onnx):
@@ -88,6 +90,12 @@ def main():
     step(f"6/6 codegen -> {a.name}.c/.h  (target={a.target})")
     codegen.main(j_fused, model, a.target, a.simd, a.debug)
 
+    if a.prefix:
+        import prefix
+        step(f"names prefixed with {a.prefix}")
+        prefix.apply(a.outdir, a.prefix, a.name)
+        model = os.path.join(a.outdir, a.prefix + a.name)
+
     if not a.keep_json:
         for j in (j_nchw, j_nhwc):        # keep fused (useful for debugging) unless you prefer not
             try: os.remove(j)
@@ -100,7 +108,7 @@ def main():
         p=os.path.join(a.outdir,f); sz=os.path.getsize(p)
         print(f"  {f:32s} {sz:>10,} B")
     print("\nnext: compile the folder, e.g.")
-    print(f"  gcc -O2 -I{a.outdir} {model}.c {a.outdir}/weights_*.c -lm -o run   # ansi targets")
+    print(f"  gcc -O2 -I{a.outdir} {model}.c {a.outdir}/{a.prefix}weights_*.c -lm -o run   # ansi targets")
 
 if __name__=="__main__":
     main()

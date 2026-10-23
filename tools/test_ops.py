@@ -145,6 +145,15 @@ def case_head_boxes():      # YOLO26n's head: boxes decoded in NCHW, scores sigm
     o1, o2 = g.node("Split", [t, g.const(np.array([4, 8], np.int64))], n_out=2, axis=2)
     return g, [o1, o2]
 
+def case_one_channel():     # a conv with one output channel (YuNet's face and object scores):
+    g = G([1, 3, 16, 16]); a = g.silu(g.conv("x", 3, 16))   # its bias is one value, and stays an array
+    return g, [g.node("Sigmoid", [g.conv(a, 16, 1, k=1)])]
+
+def case_relu():            # ReLU between convs, then a 2x2 max pool (YuNet's backbone)
+    g = G([1, 3, 16, 16]); a = g.node("Relu", [g.conv("x", 3, 16)])
+    p = g.node("MaxPool", [a], kernel_shape=[2, 2], strides=[2, 2], pads=[0, 0, 0, 0])
+    return g, [g.node("Relu", [g.conv(p, 16, 8)])]
+
 CASES = {n[5:]: f for n, f in globals().items() if n.startswith("case_")}
 
 
