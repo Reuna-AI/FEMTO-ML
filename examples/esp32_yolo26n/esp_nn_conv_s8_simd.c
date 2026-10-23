@@ -199,6 +199,30 @@ static int     s_fast_size = 0;
 static int     s_fast_owned = 0;
 static const char *s_last_path = "none";
 
+/* A table every output byte goes through before it is stored (an activation that
+ * follows the conv, such as a SiLU, folded in): the conv's own int8 result r becomes
+ * lut[r + 128]. NULL: none. Set by esp_nn_conv_s8_simd_set_out_lut(); read by the
+ * depthwise conv too, through esp_nn_simd_out_lut(). */
+static const int8_t *s_out_lut = NULL;
+
+void esp_nn_conv_s8_simd_set_out_lut(const int8_t *lut)
+{
+    s_out_lut = lut;
+}
+
+const int8_t *esp_nn_simd_out_lut(void)
+{
+    return s_out_lut;
+}
+
+/* The table over n bytes already stored: what the paths without it inline do. */
+void esp_nn_simd_apply_out_lut(int8_t *out, size_t n)
+{
+    const int8_t *lut = s_out_lut;
+    if (!lut) return;
+    for (size_t i = 0; i < n; i++) out[i] = lut[(uint8_t)(out[i] + 128)];
+}
+
 /* Taken by the first conv if the caller gave none: internal SRAM, largest first --
  * 8 KB is enough for the largest im2col window a 3x3 conv over 256 channels needs,
  * plus a block of filters -- and failing that 16 KB of PSRAM, where a block small
@@ -393,6 +417,7 @@ typedef struct {
     int32_t out_w, out_ch, nb, window_len, wla;
     int32_t out_offset, act_min, act_max, pad_val;
     int32_t safe_x0, safe_x1, safe_y0, safe_y1;
+    const int8_t *lut;           /* esp_nn_conv_s8_simd_set_out_lut()'s table, or NULL */
     int32_t y0, y1;
 } rows_job_t;
 
@@ -407,6 +432,7 @@ static void conv_rows(const rows_job_t *j)
     const int32_t *const per_oc = j->per_oc;
     const int32_t nb = j->nb, wla = j->wla, out_ch = j->out_ch;
     const int32_t out_offset = j->out_offset, act_min = j->act_min, act_max = j->act_max;
+    const int8_t *const lut = j->lut;
 
     for (int32_t out_y = j->y0; out_y < j->y1; out_y++) {
         const int32_t base_y = out_y * j->stride_h - j->pad_h;
@@ -451,7 +477,7 @@ static void conv_rows(const rows_job_t *j)
                 acc = requant_fast(acc, q[1], q[2], q[3]) + out_offset;
                 acc = max(acc, act_min);
                 acc = min(acc, act_max);
-                out_ptr[ob] = (int8_t)acc;
+                out_ptr[ob] = lut ? lut[acc + 128] : (int8_t)acc;
                 filter_ptr += wla;
                 q += PER_OC_WORDS;
             }
@@ -582,6 +608,7 @@ static void conv_s8_im2col_s3(const data_dims_t *input_dims,
     j.out_offset = conv_params->out_offset;
     j.act_min = conv_params->activation.min;
     j.act_max = conv_params->activation.max;
+    j.lut = s_out_lut;
     j.window_len = j.k_w * j.k_h * j.in_ch;
     j.wla = (j.window_len + 15) & ~15;
     /* Padding is written as -input_offset so that, after the correction below
@@ -713,5 +740,7 @@ int esp_nn_conv_s8_simd(const data_dims_t *input_dims,
     s_last_path = "c_ref";
     esp_nn_conv_s8_ref(input_dims, input_data, filter_dims, filter_data,
                        bias, output_dims, out_data, conv_params, quant_data);
+    esp_nn_simd_apply_out_lut(out_data, (size_t)output_dims->width * output_dims->height *
+                                        output_dims->channels);
     return 0;
 }

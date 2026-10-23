@@ -90,20 +90,30 @@ static int run_one(const shape_t *s, int fast_size, int misalign, int cores)
     quant_data_t qd = { shift, mult };
 
     esp_nn_depthwise_conv_s8_ref(&id, in, &fd, filt, bias, &od, a, &cp, &qd);
+    /* every other run with an output table (an activation folded in): the reference's
+     * bytes through it are what the kernel must store */
+    static int8_t lut[256];
+    const int with_lut = (rnd() & 1);
+    if (with_lut) {
+        for (int q = 0; q < 256; q++) lut[q] = (int8_t)(rnd() & 0xff);
+        for (size_t q = 0; q < n_out; q++) a[q] = lut[(uint8_t)(a[q] + 128)];
+    }
     /* the fast buffer at an odd address too: the path aligns what it lays out in it */
     esp_nn_conv_s8_simd_set_fast_buf((int8_t *)fast_raw + (misalign ? 5 : 0), fast_size);
     esp_nn_conv_s8_simd_set_cores(cores);
     memset(b, 0x55, n_out);
+    esp_nn_conv_s8_simd_set_out_lut(with_lut ? lut : NULL);
     esp_nn_depthwise_conv_s8_simd(&id, in, &fd, filt, bias, &od, b, &cp, &qd);
+    esp_nn_conv_s8_simd_set_out_lut(NULL);
 
     const char *path = esp_nn_depthwise_conv_s8_simd_last_path();
     if (strncmp(path, "dw_rows", 7) == 0) s_paths_rows++; else s_paths_other++;
 
     size_t bad = 0;
     for (size_t i = 0; i < n_out; i++) bad += a[i] != b[i];
-    printf("%s %3dx%-3d c%-3d k%dx%d s%d p%d  fast %5d  %s  %s\n",
+    printf("%s %3dx%-3d c%-3d k%dx%d s%d p%d  fast %5d  %s %s  %s\n",
            bad ? "FAIL" : "ok  ", s->in_w, s->in_h, s->ch, s->k_w, s->k_h, s->stride, s->pad,
-           fast_size, misalign ? "misaligned" : "aligned   ", path);
+           fast_size, misalign ? "misaligned" : "aligned   ", with_lut ? "lut" : "   ", path);
     if (bad) {
         printf("     %zu of %zu outputs differ; the first:", bad, n_out);
         int shown = 0;

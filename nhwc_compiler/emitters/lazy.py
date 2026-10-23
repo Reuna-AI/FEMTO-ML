@@ -128,6 +128,37 @@ def value(ctx, t, o, c, params):
         return f"({value(ctx, a, o, c, params)}+{value(ctx, b, o, c, params)})"
     raise ValueError(f"lazy tensor {t}: no expression for {op}")
 
+def byte_of(ctx, t, o, c, params):
+    """When float t at (pixel o, channel c) is made from one int8 byte: (the C that
+    reads that byte, a function giving the C of the float from a byte expression B),
+    the same float value() gives. None when it is made from two (an Add) or from a
+    stored float. A reader that only quantizes t can then quantize all 256 bytes
+    once, into a table, and look each value up."""
+    m = ctx.T[t]; C = (m.get("shape") or [1])[-1]
+    if not is_lazy(ctx, t):
+        if m.get("dtype") == "int8" and m.get("q_scale") is not None:
+            s, z = cfloat(m["q_scale"]), int(m.get("q_zp", 0))
+            return f"{params[t]}[({o})*{C}+({c})]", (lambda B: f"({s}*(float)((int){B} - ({z})))")
+        return None
+    node = _node(ctx, t); op = node["op"]
+    if op in ("SiLU", "DequantizeLinear"):
+        x = node["inputs"][0]; Cx = ctx.T[x]["shape"][-1]
+        tbl = _silu_table(ctx, node) if op == "SiLU" else _dq_table(ctx, node)
+        return f"{params[x]}[({o})*{Cx}+({c})]", (lambda B: f"{tbl}[(unsigned char)({B}+128)]")
+    if op == "Split":
+        x = node["inputs"][0]; k = node["outputs"].index(t)
+        sizes = split_sizes(ctx, node)
+        return byte_of(ctx, x, o, f"{sum(sizes[:k])}+({c})", params)
+    if op == "Resize":
+        x = node["inputs"][0]; _, H, W, _ = ctx.T[x]["shape"]; _, Ho, Wo, _ = ctx.T[t]["shape"]
+        if not nearest_supported(node["attrs"], H, W, Ho, Wo):
+            raise ValueError(f"Resize {node['name']}: nearest {H}x{W}->{Ho}x{Wo} with these modes is not supported")
+        sy = f"(int)((float)(({o})/{Wo})*((float){H}/{Ho}))"
+        sx = f"(int)((float)(({o})%{Wo})*((float){W}/{Wo}))"
+        src = f"((({sy})<{H}?({sy}):{H - 1})*{W}+(({sx})<{W}?({sx}):{W - 1}))"
+        return byte_of(ctx, x, src, c, params)
+    return None
+
 def split_sizes(ctx, node):
     """A Split's part sizes, as its emitter works them out."""
     xsh = ctx.shape(node["inputs"][0]); axis = node["attrs"].get("axis", 0)

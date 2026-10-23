@@ -44,6 +44,11 @@ FUSE_SILU_QUANTIZE = True
 # Quantize where a value is made rather than after the ops that only move it (see
 # int8_layout_paths). False for the float layout ops of before October 2026.
 INT8_LAYOUT = True
+# Fold a SiLU whose int8 table reads only one conv's output into that conv: the conv
+# stores each byte through the table (esp_nn_conv_s8_simd_set_out_lut), so the SiLU's
+# own pass over the tensor is gone. False for a separate SiLU pass, as before
+# October 2026 (the same bytes either way).
+FUSE_CONV_SILU = True
 # --------------------------------------------------------------------------
 
 def build_maps(d):
@@ -768,6 +773,43 @@ def mark_lazy_floats(d):
     return len(lazy)
 
 
+def fold_silu_into_conv(d):
+    """A SiLU in its int8-to-int8 table form (out_scale/out_zp, int8 output, nothing
+    folded into it) whose input is a QLinearConv's output read by nothing else: the
+    conv takes the SiLU's output name and the table's four quantization names
+    (attrs "silu"), and the SiLU node goes. The conv emitters then store every byte r
+    as table[r + 128], the table the SiLU emitter builds (op_silu.silu_i8_table) --
+    the same bytes, without a second pass over the tensor in PSRAM. Returns how many."""
+    if not FUSE_CONV_SILU:
+        return 0
+    T = d["tensors"]
+    prod, cons = build_maps(d)
+    outputs = set(d.get("outputs", []))
+    read_also = {r for n in d["nodes"] for r in n.get("reads", [])}
+    gone = set(); folded = 0
+    for n in d["nodes"]:
+        if n["op"] != "SiLU":
+            continue
+        a = n["attrs"]; y = n["outputs"][0]; x = n["inputs"][0]
+        if not ("out_scale" in a and "out_zp" in a) or a.get("also_q") or len(n["outputs"]) != 1:
+            continue
+        if T.get(y, {}).get("dtype") != "int8" or T.get(y, {}).get("lazy"):
+            continue
+        p = prod.get(x)
+        if p is None or p["op"] != "QLinearConv" or len(p["outputs"]) != 1 or p["attrs"].get("silu"):
+            continue
+        if len(cons.get(x, [])) != 1 or x in outputs or x in read_also:
+            continue
+        # the table's input scale is the conv's output scale
+        if (a["in_scale"], a["in_zp"]) != (p["inputs"][6], p["inputs"][7]):
+            continue
+        p["outputs"] = [y]
+        p["attrs"]["silu"] = {k: a[k] for k in ("in_scale", "in_zp", "out_scale", "out_zp")}
+        gone.add(id(n)); folded += 1
+    if folded:
+        d["nodes"] = [n for n in d["nodes"] if id(n) not in gone]
+    return folded
+
 def topo_sort(d):
     prod={o:n for n in d["nodes"] for o in n["outputs"]}
     seen=set(); order=[]
@@ -803,6 +845,8 @@ def main(inp,out):
     print(f"[fuse] transposes that undid each other, gone = {n_tr}")
     n_lazy = mark_lazy_floats(d)
     print(f"[fuse] float tensors made again where read instead of stored = {n_lazy}")
+    n_cs = fold_silu_into_conv(d)
+    print(f"[fuse] SiLUs folded into the conv before them = {n_cs}")
     topo_sort(d)
     json.dump(d, open(out,"w",encoding="utf-8"), indent=1, ensure_ascii=False)
     print(f"fuse -> {out}: SiLU fused = {n_silu}, nodes now {len(d['nodes'])}")

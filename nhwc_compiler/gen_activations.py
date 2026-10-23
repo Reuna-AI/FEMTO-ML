@@ -48,6 +48,11 @@ SRAM_PRIORITY     = "hot"           # "hot" = most-accessed unions first
                                     # "large" = largest unions first
 # --------------------------------------------------------------------------------
 
+# Pack the unions largest tensor first, each where it grows the arena least (step 3).
+# False for first-fit in order of first use, as before October 2026: more memory, the
+# same results (a union only ever holds tensors that are never alive together).
+ARENA_BEST_FIT = True
+
 def san(n): return "tensor_"+"".join(c if c.isalnum() else "_" for c in n)
 
 def sh_of(meta): return meta.get('shape',[])
@@ -179,19 +184,36 @@ def main(json_path, out_h, target="ansi_int8"):
     items=[{"def":min(m["def"] for m in g),"end":max(m["end"] for m in g),
             "bytes":max(m["off"]+m["bytes"] for m in g),"members":g} for g in groups.values()]
 
-    # 3) interval-graph greedy coloring: sort by def; assign to first union whose
-    #    tensors' intervals don't overlap this one.
-    items.sort(key=lambda t:(t["def"], -t["bytes"]))
-    unions=[]                     # each: list of members; and its current 'busy until' per member
-    placed_items=[]               # per union: the items in it
+    # 3) interval-graph coloring: no two tensors whose lifetimes overlap share a union.
+    #    Best fit (ARENA_BEST_FIT): the largest tensors first, each into the union it
+    #    grows least (of those it fits in by lifetime), so big tensors share unions with
+    #    each other and small ones fill in under them. YOLO26n at 256x256: 3.15 -> 1.76 MB
+    #    of unions. Otherwise, as before: in order of first use, into the first union free.
     def overlaps(a,b): return not (a["end"]<b["def"] or b["end"]<a["def"])  # inclusive: in/out of same op conflict
-    for it in items:
-        placed=False
-        for ui,u in enumerate(unions):
-            if all(not overlaps(it,o) for o in placed_items[ui]):
-                u.extend(it["members"]); placed_items[ui].append(it); placed=True; break
-        if not placed:
-            unions.append(list(it["members"])); placed_items.append([it])
+    unions=[]                     # each: the members of its items
+    placed_items=[]               # per union: the items in it
+    if ARENA_BEST_FIT:
+        items.sort(key=lambda t:(-t["bytes"], t["def"], t["end"]))
+        for it in items:
+            best=None
+            for ui in range(len(unions)):
+                if all(not overlaps(it,o) for o in placed_items[ui]):
+                    cur=max(o["bytes"] for o in placed_items[ui])
+                    key=(max(0,it["bytes"]-cur), cur, ui)
+                    if best is None or key<best: best=key
+            if best is None:
+                unions.append(list(it["members"])); placed_items.append([it])
+            else:
+                ui=best[2]; unions[ui].extend(it["members"]); placed_items[ui].append(it)
+    else:
+        items.sort(key=lambda t:(t["def"], -t["bytes"]))
+        for it in items:
+            placed=False
+            for ui,u in enumerate(unions):
+                if all(not overlaps(it,o) for o in placed_items[ui]):
+                    u.extend(it["members"]); placed_items[ui].append(it); placed=True; break
+            if not placed:
+                unions.append(list(it["members"])); placed_items.append([it])
 
     # 3b) Access frequency per tensor = number of nodes that read or write it.
     #     Union access count = sum over its members (members alias but are used at

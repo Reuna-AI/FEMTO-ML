@@ -492,6 +492,7 @@ typedef struct {
     const int16_t *filter16;      /* [k_h * k_w][ch_p], 16-byte aligned, pad lanes 0 */
     const int32_t *per_ch;        /* ch_p x DW_PER_CH */
     int16_t *ring;                /* this core's k_h rows of row_w x pass int16 */
+    const int8_t *lut;            /* esp_nn_conv_s8_simd_set_out_lut()'s table, or NULL */
     int32_t in_w, in_h, ch, ch_p, k_w, k_h, stride_w, stride_h, pad_w, pad_h;
     int32_t out_w, row_w, pass;   /* row_w: columns a row holds; pass: channels at a time */
     int32_t in_offset, out_offset, act_min, act_max;
@@ -531,6 +532,7 @@ static void dw_rows(void *arg)
     const int32_t out_offset = j->out_offset, act_min = j->act_min, act_max = j->act_max;
     const int16_t *const filter16 = j->filter16;
     const int32_t *const per_ch = j->per_ch;
+    const int8_t *const lut = j->lut;
     uint8_t raw_buf[64 + 16];
     uint8_t *const raw = (uint8_t *)DW_ALIGN16(raw_buf);
 
@@ -581,7 +583,7 @@ static void dw_rows(void *arg)
                         r = rw_requant(r, q[1], q[2], q[3]) + out_offset;
                         r = max(r, act_min);
                         r = min(r, act_max);
-                        opix[cg + l] = (int8_t)r;
+                        opix[cg + l] = lut ? lut[r + 128] : (int8_t)r;
                         q += DW_PER_CH;
                     }
                 }
@@ -673,6 +675,7 @@ static int dw_rows_run(const data_dims_t *input_dims, const int8_t *input_data,
 
     j.input = input_data;
     j.out = out_data;
+    j.lut = esp_nn_simd_out_lut();
     j.filter16 = filter16;
     j.per_ch = per_ch;
 
@@ -747,7 +750,12 @@ static int dw_rows_check(void)
 int esp_nn_depthwise_conv_s8_simd_self_check(void)
 {
 #if ESP_NN_S3_PATHS
-    if (s_rows_ok < 0) s_rows_ok = dw_rows_check();
+    if (s_rows_ok < 0) {
+        const int8_t *lut = esp_nn_simd_out_lut();   /* the check compares plain outputs */
+        esp_nn_conv_s8_simd_set_out_lut(NULL);
+        s_rows_ok = dw_rows_check();
+        esp_nn_conv_s8_simd_set_out_lut(lut);
+    }
     return s_rows_ok;
 #else
     return -1;
@@ -792,6 +800,8 @@ int esp_nn_depthwise_conv_s8_simd(const data_dims_t *input_dims,
             dw_conv_s8_mult1_s3(input_dims, input_data, filter_dims,
                                 filter_data, bias, output_dims, out_data,
                                 conv_params, quant_data, scratch);
+            esp_nn_simd_apply_out_lut(out_data, (size_t)output_dims->width *
+                                      output_dims->height * output_dims->channels);
             return 0;
         }
         /* scratch too small / alloc failed -> fall through to C */
@@ -802,5 +812,7 @@ int esp_nn_depthwise_conv_s8_simd(const data_dims_t *input_dims,
     esp_nn_depthwise_conv_s8_ref(input_dims, input_data, filter_dims,
                                  filter_data, bias, output_dims, out_data,
                                  conv_params, quant_data);
+    esp_nn_simd_apply_out_lut(out_data, (size_t)output_dims->width *
+                              output_dims->height * output_dims->channels);
     return 0;
 }

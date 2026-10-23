@@ -128,6 +128,21 @@ int esp_nn_conv_s8_simd_set_cores(int cores);
 int esp_nn_conv_s8_simd_cores(void);
 
 /**
+ * A 256-byte table every output of the following convs and depthwise convs goes
+ * through as it is stored: the int8 result r is stored as lut[r + 128] (an
+ * activation such as SiLU folded into the conv, so its own pass over the output is
+ * not needed). NULL (the default) for none. Set it just before the call and clear it
+ * just after; the table must outlive the call.
+ */
+void esp_nn_conv_s8_simd_set_out_lut(const int8_t *lut);
+
+/** The table set above, or NULL. */
+const int8_t *esp_nn_simd_out_lut(void);
+
+/** The table over n output bytes already stored (no-op without one). */
+void esp_nn_simd_apply_out_lut(int8_t *out, size_t n);
+
+/**
  * The fast buffer itself, taken now if no conv has taken it yet (NULL if none can
  * be had), and its size in *size. For another kernel run from the same task
  * between convs -- the depthwise conv borrows it for its rows -- never during one.

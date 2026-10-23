@@ -219,6 +219,7 @@ python tools/test_golden.py      # YOLO26n gives exactly its recorded outputs (e
 FEMTO_CFLAGS=-DESP_NN_S3_EMULATE python tools/test_golden.py   # the same through the S3 paths' loops
 python tools/test_ops.py         # small models of other shapes against onnxruntime
 python tools/test_two_models.py  # two models in one program (--prefix); a model fed int8 only
+python tools/test_fusions.py     # SiLUs folded into convs, Concat byte tables: the same bytes on and off
 python tools/femto_bench.py examples/esp32_yolo26n/yolo26n_q.onnx   # memory and traffic scorecard
 ```
 The S3 kernels' own loops, bit for bit against their plain-C references, with plain-C

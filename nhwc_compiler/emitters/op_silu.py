@@ -35,6 +35,19 @@ def _lut_i8_loop(n):
             f"            | (uint32_t)(uint8_t)lut[(v>>16)&255]<<16 | (uint32_t)(uint8_t)lut[v>>24]<<24; }} }}\n"
             f"  for(;i<{n};++i) y[i]=lut[(unsigned char)(x[i]+128)];")
 
+def silu_i8_table(is_, iz, os_, oz_):
+    """quantize(silu(dequantize(q))) for the 256 int8 values q, index q+128: the int8
+    SiLU's table, here and in a conv it is folded into (fuse.py fold_silu_into_conv)."""
+    lut=[]
+    for q in range(256):
+        xf=is_*((q-128)-iz)
+        sv=xf/(1.0+math.exp(-xf))               # silu (float)
+        r=int(round(sv/os_))+oz_                 # quantize to int8
+        if r<-128: r=-128
+        if r>127: r=127
+        lut.append(r)
+    return lut
+
 @register("SiLU")
 def emit(ctx, node):
     x=node["inputs"][0]; y=node["outputs"][0]; a=node["attrs"]
@@ -82,15 +95,7 @@ def emit(ctx, node):
         return
     if fused_q:
         # int8 LUT: quantize( silu(dequant(q)) ) baked in. int8 -> int8, quantize is FREE.
-        lut=[]
-        for q in range(256):
-            xf=is_*((q-128)-iz)
-            sv=xf/(1.0+math.exp(-xf))               # silu (float)
-            r=int(round(sv/os_))+oz_                 # quantize to int8
-            if r<-128: r=-128
-            if r>127: r=127
-            lut.append(r)
-        tbl=", ".join(str(v) for v in lut)
+        tbl=", ".join(str(v) for v in silu_i8_table(is_, iz, os_, oz_))
         sig=f"void {fn}(const int8_t* x, int8_t* y)"
         h.append(sig+";")
         b.append(f"// SiLU {node['name']}  n={n}  in=({is_:.6g},{iz}) out=({os_:.6g},{oz_})  int8->int8 (quant fused)")

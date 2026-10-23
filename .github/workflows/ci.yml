@@ -57,5 +57,7 @@ jobs:
         run: python tools/test_ops.py
       - name: Two models in one program (--prefix), and the int8 input alone
         run: python tools/test_two_models.py
+      - name: Fusions that must not change a byte (SiLU into conv, Concat byte tables)
+        run: python tools/test_fusions.py
       - name: Scorecard
         run: python tools/femto_bench.py examples/esp32_yolo26n/yolo26n_q.onnx

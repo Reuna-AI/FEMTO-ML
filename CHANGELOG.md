@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (fifth round, October 2026)
+Measured on the board before this round, YOLO26n spent 228 ms a run in Concat and 136 ms in
+SiLU -- ops that only move and look up bytes -- and its working memory was 3.9 MB of PSRAM.
+Every change below gives the same bytes as before (YOLO26n's golden outputs, both targets,
+multiply-add fusion on and off, the S3 paths emulated; `tools/test_fusions.py`, new, builds
+eight of `test_ops.py`'s models with the first two on and off and compares the outputs).
+- A SiLU whose int8 table reads only one conv's output is folded into that conv
+  (`fuse.py fold_silu_into_conv`, `FUSE_CONV_SILU`): the conv stores each byte through the
+  SiLU's table (`esp_nn_conv_s8_simd_set_out_lut()`, honoured by every conv and depthwise path),
+  so the SiLU's own read and write of the whole tensor in PSRAM are gone. YOLO26n: 42 of its
+  57 SiLUs; ops 268 -> 226, memory traffic per run (estimate) 24.3 -> 21.2 MB.
+- A Concat input whose values each come from one int8 byte (through a SiLU or
+  DequantizeLinear table, a Split, a nearest Resize) and are only quantized there is quantized
+  through a 256-entry byte table, made on the first run by the same expressions and kept in
+  PSRAM (`CONCAT_BYTE_TABLES`): one lookup a value instead of a float table read, a multiply, a
+  rounding and a clamp. If the table cannot be allocated, the float loop runs as before.
+- The arena's unions are packed largest tensor first, each where it grows the arena least
+  (`gen_activations.py`, `ARENA_BEST_FIT`), instead of first-fit in order of first use: YOLO26n's
+  unions 3.15 -> 1.76 MB (working memory 3.94 -> 2.55 MB), the YuNet face finder's 0.88 -> 0.76 MB.
+  A union still only holds tensors that are never alive together.
+
 ### Changed (fourth round, October 2026)
 - Depthwise convs on the ESP32-S3 (`esp_nn_depthwise_conv_s8_simd.c`). Measured on the board,
   every depthwise layer of YOLO26n and of a YuNet face finder ran at about 11 million MACs a

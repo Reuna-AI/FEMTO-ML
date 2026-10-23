@@ -24,7 +24,7 @@ Everything else is pure float32. Structural ops read static attrs from JSON.
 Signatures pass explicit buffers; shapes/attrs baked as literals.
 """
 from . import register, REGISTRY
-from .lazy import is_lazy, sources, value, begin as lazy_begin, prelude as lazy_prelude
+from .lazy import is_lazy, sources, value, byte_of, begin as lazy_begin, prelude as lazy_prelude
 from .common import nearest_supported, fsan, san, wsan, numel, cfloat, quant_c, also_q, also_q_consts, also_q_stores, main_outputs
 
 def _sig(fn, args): return f"void {fn}({', '.join(args)})"
@@ -267,6 +267,14 @@ def emit_concat(ctx,node):
     b.append("}"); b.append("")
     ctx.calls.append((node,fn,list(ins)+[outs]+[e["dst"] for e in extra]))
 
+# Quantize a lazy Concat input whose values each come from one int8 byte through a
+# 256-entry table made on the first run (_emit_concat_lazy). False for the float
+# expression at every value, as before October 2026 (the same bytes either way).
+CONCAT_BYTE_TABLES = True
+
+def _byte_tables():
+    return CONCAT_BYTE_TABLES
+
 def _emit_concat_lazy(ctx,node,axis):
     """A float channel Concat with lazy inputs (fuse.py mark_lazy_floats): each value
     made from its int8 where it is placed, then stored and/or quantized as the plain
@@ -284,6 +292,11 @@ def _emit_concat_lazy(ctx,node,axis):
     params={t:f"s{j}" for j,t in enumerate(srcs)}
     lazy_begin(ctx)
     vals=[value(ctx,i,"o","a",params) for i in ins]
+    # An input whose every value is made from one int8 byte, and only quantized here:
+    # its 256 possible bytes quantized once, by the same expressions, into a table
+    # filled on the first run -- then one lookup a value instead of a float table read,
+    # a multiply, a rounding and a clamp (the same bytes; CONCAT_BYTE_TABLES below).
+    bytes_=[byte_of(ctx,i,"o","a",params) if (extra and not keep and _byte_tables()) else None for i in ins]
     args=[f"const {'int8_t' if ctx.T[t].get('dtype')=='int8' else 'float'}* s{j}" for j,t in enumerate(srcs)]
     args.append("float* y"); args+=[f"int8_t* q{k}" for k in range(len(extra))]
     sig=_sig(fn,args); ctx.header.append(sig+";")
@@ -294,8 +307,21 @@ def _emit_concat_lazy(ctx,node,axis):
     off=0
     for i,inp in enumerate(ins):
         ad=ctx.shape(inp)[-1]; dst=f"o*{C}+({off}+a)"
-        b.append(f"  for(int o=0;o<{outer};++o) for(int a=0;a<{ad};++a){{ float v={vals[i]}; "
-                 + (f"y[{dst}]=v; " if keep else "") + (also_q_stores(extra, "v", dst) if extra else "") + " }")
+        if bytes_[i]:
+            # the table in PSRAM (ARENA_ALLOC_PSRAM, once), not static: internal RAM is
+            # the wifi's; no memory for it, and the float loop below runs instead
+            read, made = bytes_[i]; nq=len(extra)
+            b.append(f"  static int8_t (*ct{i})[256]=0; static int ct{i}_state=0;   // byte table: 0 not made yet, 1 made, -1 no memory")
+            b.append(f"  if(!ct{i}_state){{ ct{i}=(int8_t(*)[256])ARENA_ALLOC_PSRAM({nq}*256); ct{i}_state=ct{i}?1:-1;")
+            b.append(f"    if(ct{i}) for(int bb=0;bb<256;++bb){{ float v={made('((int8_t)(bb-128))')}; "
+                     + " ".join(quant_c(f"ct{i}[{k}][bb]", "v", inv=f"inv{k}", z=f"z{k}") for k in range(nq)) + " } }")
+            b.append(f"  if(ct{i}) for(int o=0;o<{outer};++o) for(int a=0;a<{ad};++a){{ const unsigned char u_=(unsigned char)({read}+128); "
+                     + " ".join(f"q{k}[{dst}]=ct{i}[{k}][u_];" for k in range(nq)) + " }")
+            b.append(f"  else for(int o=0;o<{outer};++o) for(int a=0;a<{ad};++a){{ float v={vals[i]}; "
+                     + also_q_stores(extra, "v", dst) + " }")
+        else:
+            b.append(f"  for(int o=0;o<{outer};++o) for(int a=0;a<{ad};++a){{ float v={vals[i]}; "
+                     + (f"y[{dst}]=v; " if keep else "") + (also_q_stores(extra, "v", dst) if extra else "") + " }")
         off+=ad
     b.append("}"); b.append("")
     ctx.calls.append((node,fn,srcs+[outs]+[e["dst"] for e in extra]))
