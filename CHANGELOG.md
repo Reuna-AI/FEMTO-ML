@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (fourth round, October 2026)
+- Depthwise convs on the ESP32-S3 (`esp_nn_depthwise_conv_s8_simd.c`). Measured on the board,
+  every depthwise layer of YOLO26n and of a YuNet face finder ran at about 11 million MACs a
+  second -- slower than the regular convs beside them, and in YuNet, which is mostly depthwise
+  and pointwise, they were over half its time. The old S3 path converted the whole padded
+  input to int16 first (674 KB for a 160x128x16 layer: in PSRAM if it could be had, and the
+  plain-C reference if not) and read QACC's lanes back with unaligned 32-bit loads. The new
+  rows path keeps only the k_h input rows each output row needs, as int16 with the padding in
+  place, in the regular convs' fast buffer (internal SRAM, borrowed between convs), each row
+  converted once while later rows still read it; channels go in passes of a multiple of 8 when
+  all of them do not fit; QACC is read back a byte at a time; the requant is the convs'
+  `requant_fast()`; and with `esp_nn_conv_s8_simd_set_cores(2)` the other core takes half the
+  output rows. Before its first use it checks itself against the reference on five small
+  layers and, if it ever disagrees, is never used (the old paths run as before);
+  `esp_nn_depthwise_conv_s8_simd_self_check()` says which.
+- The convs' second-core worker runs any function handed to it (`esp_nn_simd_both_cores()`),
+  so the depthwise conv shares it; `esp_nn_conv_s8_simd_cores()` and
+  `esp_nn_conv_s8_simd_borrow_fast_buf()` are new.
+- Checked: `tools/test_dw_kernels.c` (new) runs every depthwise shape of both models and odd
+  ones (channel counts not a multiple of 8, stride 2 and 3, 5x5, 1x3, 3x1 and 1x1 filters, no
+  padding, an output narrower than the padding) with four fast-buffer sizes, one core and two,
+  aligned and not: bit-exact against the reference, with QACC's lanes stored byte for byte as
+  the S3 stores them. YOLO26n's golden outputs are unchanged on both targets, also built with
+  `ESP_NN_S3_EMULATE` (CI runs that too), and a YuNet face finder gives the same bytes either way.
+
 ### Added (third round, October 2026)
 - `--prefix` (`nhwc_compiler/prefix.py`): a model's files and every name it makes visible
   (functions, weights, arena unions and pointers, tensor macros, `MODEL_INPUT_*`) get a prefix,

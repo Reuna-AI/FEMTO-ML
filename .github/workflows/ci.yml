@@ -41,8 +41,16 @@ jobs:
           ./test_conv_ref
           gcc -O2 -DESP_NN_S3_EMULATE -I examples/esp32_yolo26n tools/test_conv_kernels.c examples/esp32_yolo26n/esp_nn_conv_s8_simd.c -lm -o test_conv_s3
           ./test_conv_s3
+      - name: Depthwise conv kernels, bit for bit (C reference paths, then the S3 rows path emulated)
+        run: |
+          gcc -O2 -I examples/esp32_yolo26n tools/test_dw_kernels.c examples/esp32_yolo26n/esp_nn_depthwise_conv_s8_simd.c examples/esp32_yolo26n/esp_nn_conv_s8_simd.c -lm -o test_dw_ref
+          ./test_dw_ref
+          gcc -O2 -DESP_NN_S3_EMULATE -I examples/esp32_yolo26n tools/test_dw_kernels.c examples/esp32_yolo26n/esp_nn_depthwise_conv_s8_simd.c examples/esp32_yolo26n/esp_nn_conv_s8_simd.c -lm -o test_dw_s3
+          ./test_dw_s3
       - name: YOLO26n golden outputs (esp32s3 and ansi_int8)
         run: python tools/test_golden.py
+      - name: The same, through the S3 paths' loops (ESP_NN_S3_EMULATE)
+        run: FEMTO_CFLAGS="-DESP_NN_S3_EMULATE" python tools/test_golden.py
       - name: The same, with multiply-add fusion on (as the board's compiler builds)
         run: FEMTO_CFLAGS="-mfma -ffp-contract=fast" python tools/test_golden.py
       - name: Op cases against onnxruntime

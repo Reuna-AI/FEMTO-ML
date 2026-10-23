@@ -9,10 +9,14 @@
  * so keep both .h/.c pairs together in your project.
  *
  * Paths selected automatically at runtime:
- *   1. ch_mult == 1 on ESP32-S3 -> int16 pre-conversion + QACC 8-lane
- *      elementwise MAC (input converted once to (val+offset) int16 with
- *      spatial padding baked in, so the hot loop has zero edge checks)
- *   2. ch_mult > 1, or non-S3   -> plain C fallback (bit-exact)
+ *   1. ch_mult == 1 on ESP32-S3 -> the rows path: the few input rows each
+ *      output row needs, as int16 with the padding in place, in the regular
+ *      convs' fast buffer (internal SRAM), QACC 8-lane elementwise MAC, on
+ *      both cores after esp_nn_conv_s8_simd_set_cores(2). Checked against the
+ *      reference before its first use; never used if that check fails.
+ *   2. ch_mult == 1 on ESP32-S3, the rows path unavailable -> the whole input
+ *      converted to int16 once, in a scratch buffer (the old path)
+ *   3. ch_mult > 1, or non-S3   -> plain C fallback (bit-exact)
  *
  * ---------------------------------------------------------------------------
  * USAGE
@@ -107,8 +111,14 @@ void esp_nn_depthwise_conv_s8_ref(const data_dims_t *input_dims,
                                   const dw_conv_params_t *conv_params,
                                   const quant_data_t *quant_data);
 
-/** Path used by last call: "dw_s16_simd" or "dw_c_ref". */
+/** Path used by last call: "dw_rows_simd_2core", "dw_rows_simd", "dw_s16_simd"
+ *  or "dw_c_ref". */
 const char *esp_nn_depthwise_conv_s8_simd_last_path(void);
+
+/** The rows path's check against the reference, run now if not run yet:
+ *  1 passed (the rows path is used), 0 failed (never used), -1 no rows path
+ *  on this target. The first depthwise conv runs it if nothing has. */
+int esp_nn_depthwise_conv_s8_simd_self_check(void);
 
 #ifdef __cplusplus
 }

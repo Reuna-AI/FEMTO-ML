@@ -213,12 +213,19 @@ python tools/compare_fuse_modes.py compare --true dump_true.txt --false dump_fal
 
 ## Testing on a PC
 
-No board needed: the generated C is built with gcc and run (CI runs all three):
+No board needed: the generated C is built with gcc and run (CI runs all of these):
 ```bash
 python tools/test_golden.py      # YOLO26n gives exactly its recorded outputs (esp32s3 and ansi_int8)
+FEMTO_CFLAGS=-DESP_NN_S3_EMULATE python tools/test_golden.py   # the same through the S3 paths' loops
 python tools/test_ops.py         # small models of other shapes against onnxruntime
 python tools/test_two_models.py  # two models in one program (--prefix); a model fed int8 only
 python tools/femto_bench.py examples/esp32_yolo26n/yolo26n_q.onnx   # memory and traffic scorecard
+```
+The S3 kernels' own loops, bit for bit against their plain-C references, with plain-C
+stand-ins for the vector instructions (`ESP_NN_S3_EMULATE`):
+```bash
+gcc -O2 -DESP_NN_S3_EMULATE -I examples/esp32_yolo26n tools/test_conv_kernels.c examples/esp32_yolo26n/esp_nn_conv_s8_simd.c -lm -o test_conv && ./test_conv
+gcc -O2 -DESP_NN_S3_EMULATE -I examples/esp32_yolo26n tools/test_dw_kernels.c examples/esp32_yolo26n/esp_nn_depthwise_conv_s8_simd.c examples/esp32_yolo26n/esp_nn_conv_s8_simd.c -lm -o test_dw && ./test_dw
 ```
 A compiler change that should not change results must leave `test_golden.py` passing. One
 that should (a better rounding, say) is checked against onnxruntime first, then recorded
@@ -250,7 +257,9 @@ Measured on **ESP32-S3** (validated targets):
 The SIMD path is only as fast as its operands arrive: on the S3, PSRAM and flash are read
 through a 32 KB data cache, so the convs run in blocks of output channels whose filters fit in
 a buffer of internal SRAM (`esp_nn_conv_s8_simd_set_fast_buf()`), instead of streaming a
-layer's filters from PSRAM for every output pixel. Build with `-D FEMTO_PROFILE=1` and call
+layer's filters from PSRAM for every output pixel. Depthwise convs use the same buffer between
+convs for the few int16 input rows each output row needs, rather than an int16 copy of their
+whole input. Build with `-D FEMTO_PROFILE=1` and call
 `femto_prof_report()` to see where each run's time goes, node by node. Input resolution
 (e.g. 192×192 or 160×160) cuts MACs quadratically on top, as a model re-export rather than a
 compiler change. See [`docs/`](docs/) for the full breakdown.

@@ -124,6 +124,23 @@ int esp_nn_conv_s8_simd_fast_size(void);
  */
 int esp_nn_conv_s8_simd_set_cores(int cores);
 
+/** The number of cores the convs run on now: 1, or 2 after set_cores(2). */
+int esp_nn_conv_s8_simd_cores(void);
+
+/**
+ * The fast buffer itself, taken now if no conv has taken it yet (NULL if none can
+ * be had), and its size in *size. For another kernel run from the same task
+ * between convs -- the depthwise conv borrows it for its rows -- never during one.
+ */
+void *esp_nn_conv_s8_simd_borrow_fast_buf(int *size);
+
+/**
+ * With esp_nn_conv_s8_simd_set_cores(2): fn(theirs) on the worker on the other
+ * core while fn(mine) runs here; returns 1 once both are done. Returns 0, having
+ * run nothing, on one core. For kernels that split their rows like the convs.
+ */
+int esp_nn_simd_both_cores(void (*fn)(void *), void *mine, void *theirs);
+
 /**
  * Kept for the old API: always 0 now, as the S3 paths need only the fast buffer.
  */

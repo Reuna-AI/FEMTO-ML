@@ -259,6 +259,13 @@ void esp_nn_conv_s8_simd_set_scratch_buf(void *buf, int size_bytes)
     esp_nn_conv_s8_simd_set_fast_buf(buf, size_bytes);
 }
 
+/* The fast buffer, for another kernel to use between convs (the depthwise conv's
+ * rows): taken now if no conv has taken it yet. */
+void *esp_nn_conv_s8_simd_borrow_fast_buf(int *size)
+{
+    return fast_buf(size);
+}
+
 const char *esp_nn_conv_s8_simd_last_path(void)
 {
     return s_last_path;
@@ -453,20 +460,30 @@ static void conv_rows(const rows_job_t *j)
     }
 }
 
-/* ---- the other core ------------------------------------------------- */
+/* ---- the other core ------------------------------------------------- *
+ * One worker, shared by every kernel that splits its rows between the cores
+ * (the depthwise conv too, esp_nn_simd_both_cores()): it runs whatever function
+ * it is handed, on the half of the rows it is handed.                       */
 static int s_cores = 1;
+
+static void conv_rows_any(void *job)
+{
+    conv_rows((const rows_job_t *)job);
+}
 
 #if ESP_NN_S3_SIMD
 static TaskHandle_t s_worker = NULL;
 static TaskHandle_t s_waiter = NULL;
 static rows_job_t s_job;
+static void (*s_fn)(void *) = NULL;
+static void *s_arg = NULL;
 
 static void worker_main(void *arg)
 {
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        conv_rows(&s_job);
+        s_fn(s_arg);
         xTaskNotifyGive(s_waiter);
     }
 }
@@ -484,14 +501,22 @@ int esp_nn_conv_s8_simd_set_cores(int cores)
     return s_cores;
 }
 
-/* Rows [mid, y1) on the worker, [y0, mid) here; back when both are done. */
-static void run_rows(rows_job_t *mine, const rows_job_t *theirs)
+int esp_nn_conv_s8_simd_cores(void)
 {
-    s_job = *theirs;
+    return s_cores;
+}
+
+/* fn(theirs) on the worker, fn(mine) here; back when both are done. */
+int esp_nn_simd_both_cores(void (*fn)(void *), void *mine, void *theirs)
+{
+    if (s_cores < 2 || !s_worker) return 0;
+    s_fn = fn;
+    s_arg = theirs;
     s_waiter = xTaskGetCurrentTaskHandle();
     xTaskNotifyGive(s_worker);
-    conv_rows(mine);
+    fn(mine);
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    return 1;
 }
 #else
 int esp_nn_conv_s8_simd_set_cores(int cores)
@@ -501,12 +526,32 @@ int esp_nn_conv_s8_simd_set_cores(int cores)
     return s_cores;
 }
 
+int esp_nn_conv_s8_simd_cores(void)
+{
+    return s_cores;
+}
+
+int esp_nn_simd_both_cores(void (*fn)(void *), void *mine, void *theirs)
+{
+    if (s_cores < 2) return 0;
+    fn(mine);
+    fn(theirs);
+    return 1;
+}
+#endif
+
+/* Rows [mid, y1) on the worker, [y0, mid) here. */
 static void run_rows(rows_job_t *mine, const rows_job_t *theirs)
 {
+#if ESP_NN_S3_SIMD
+    s_job = *theirs;
+    if (esp_nn_simd_both_cores(conv_rows_any, mine, &s_job)) return;
+#else
+    if (esp_nn_simd_both_cores(conv_rows_any, mine, (void *)theirs)) return;
+#endif
     conv_rows(mine);
     conv_rows(theirs);
 }
-#endif
 
 /* ---- every plain conv: im2col + ACCX dot product, blocks of output channels -- *
  * Handles 1x1, padding, any stride, any filter size, any in_ch.                   */
@@ -608,6 +653,17 @@ int esp_nn_conv_s8_simd_set_cores(int cores)
 {
     (void)cores;
     return 1;
+}
+
+int esp_nn_conv_s8_simd_cores(void)
+{
+    return 1;
+}
+
+int esp_nn_simd_both_cores(void (*fn)(void *), void *mine, void *theirs)
+{
+    (void)fn; (void)mine; (void)theirs;
+    return 0;
 }
 
 #endif /* ESP_NN_S3_PATHS */
