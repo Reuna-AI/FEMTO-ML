@@ -155,6 +155,7 @@ python nhwc_compiler/build_model.py <model_q.onnx> <outdir/> [flags]
 | `--debug`        | flag                                        | off           | Emit per-node trace prints on device                             |
 | `--name`         | string                                      | `model`       | Basename for the generated `model.c` / `model.h`                 |
 | `--keep-json`    | flag                                        | off           | Keep intermediate `.json` IR files instead of cleaning them up   |
+| `--prefix`       | C identifier, e.g. `face_`                  | none          | Prefix the files and every name the model makes visible, so two models can be built into one firmware |
 
 The `codegen.py` stage (invoked by the orchestrator, or runnable directly) additionally
 supports device‑validation flags: `--dump` (per-node activation dump over serial),
@@ -170,9 +171,16 @@ regeneration from ONNX:
 
 | Directive             | File                 | Default | Meaning                                             |
 |-----------------------|----------------------|---------|-----------------------------------------------------|
-| `FUSE_SILU_QUANTIZE`  | `fuse.py`            | `False` | Fold post-SiLU Quantize into an int8 SiLU LUT       |
+| `FUSE_SILU_QUANTIZE`  | `fuse.py`            | `True`  | Fold post-SiLU Quantize into an int8 SiLU LUT       |
+| `INT8_LAYOUT`         | `fuse.py`            | `True`  | Quantize where a value is made, move int8 after     |
+| `LAZY_FLOATS`         | `fuse.py`            | `True`  | Make table-derived floats again where read, unstored|
 | `SRAM_BUDGET_BYTES`   | `gen_activations.py` | 128 KiB | Fast-RAM budget for the hybrid arena (experimental) |
 | `SRAM_PRIORITY`       | `gen_activations.py` | `"hot"` | `"hot"` (most-accessed) or `"large"` (biggest-first)|
+
+One switch is set when the generated C is compiled, not when it is generated:
+`-DFEMTO_NO_FLOAT_INPUT` leaves the model's float input unallocated, for a caller that writes
+the int8 input itself (`model_input_int8`, then `run_model_int8_input()`); `run_model()` is then
+not defined, and a model without an int8 input entry refuses to build with it.
 
 ---
 
@@ -203,6 +211,27 @@ python tools/compare_fuse_modes.py capture --mode true  --port <PORT> --out dump
 python tools/compare_fuse_modes.py compare --true dump_true.txt --false dump_false.txt
 ```
 
+## Testing on a PC
+
+No board needed: the generated C is built with gcc and run (CI runs all of these):
+```bash
+python tools/test_golden.py      # YOLO26n gives exactly its recorded outputs (esp32s3 and ansi_int8)
+FEMTO_CFLAGS=-DESP_NN_S3_EMULATE python tools/test_golden.py   # the same through the S3 paths' loops
+python tools/test_ops.py         # small models of other shapes against onnxruntime
+python tools/test_two_models.py  # two models in one program (--prefix); a model fed int8 only
+python tools/test_fusions.py     # SiLUs folded into convs, Concat byte tables: the same bytes on and off
+python tools/femto_bench.py examples/esp32_yolo26n/yolo26n_q.onnx   # memory and traffic scorecard
+```
+The S3 kernels' own loops, bit for bit against their plain-C references, with plain-C
+stand-ins for the vector instructions (`ESP_NN_S3_EMULATE`):
+```bash
+gcc -O2 -DESP_NN_S3_EMULATE -I examples/esp32_yolo26n tools/test_conv_kernels.c examples/esp32_yolo26n/esp_nn_conv_s8_simd.c -lm -o test_conv && ./test_conv
+gcc -O2 -DESP_NN_S3_EMULATE -I examples/esp32_yolo26n tools/test_dw_kernels.c examples/esp32_yolo26n/esp_nn_depthwise_conv_s8_simd.c examples/esp32_yolo26n/esp_nn_conv_s8_simd.c -lm -o test_dw && ./test_dw
+```
+A compiler change that should not change results must leave `test_golden.py` passing. One
+that should (a better rounding, say) is checked against onnxruntime first, then recorded
+with `python tools/test_golden.py --update` and explained in CHANGELOG.md.
+
 ## Inspecting the graph
 
 `viz.py` renders the compiler's JSON IR as a Graphviz dataflow graph — useful for
@@ -226,11 +255,15 @@ Measured on **ESP32-S3** (validated targets):
 |----------|---------------------------|-------------------------|----------|
 | YOLOv5n  | ~24 s                     | ~5 s                    | ~5×      |
 
-Once convolutions are on the SIMD path, most of the compute is already accelerated, so
-further op-level optimizations (SiLU+Quantize fusion, depthwise SIMD, arena placement) change
-total runtime only marginally (~1%). **After SIMD, the most effective remaining lever is input
-resolution** — a smaller input (e.g. 192×192 or 160×160) reduces MACs quadratically and is a
-model re-export rather than a compiler change. See [`docs/`](docs/) for the full breakdown.
+The SIMD path is only as fast as its operands arrive: on the S3, PSRAM and flash are read
+through a 32 KB data cache, so the convs run in blocks of output channels whose filters fit in
+a buffer of internal SRAM (`esp_nn_conv_s8_simd_set_fast_buf()`), instead of streaming a
+layer's filters from PSRAM for every output pixel. Depthwise convs use the same buffer between
+convs for the few int16 input rows each output row needs, rather than an int16 copy of their
+whole input. Build with `-D FEMTO_PROFILE=1` and call
+`femto_prof_report()` to see where each run's time goes, node by node. Input resolution
+(e.g. 192×192 or 160×160) cuts MACs quadratically on top, as a model re-export rather than a
+compiler change. See [`docs/`](docs/) for the full breakdown.
 
 ---
 

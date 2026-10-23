@@ -121,7 +121,11 @@ Inference is **~8.9 s at 256×256**, and this is **inherent, not a bug**:
 - **99.5%** of conv MACs already run on the esp‑nn SIMD path. `428M ÷ ~50 MMAC/s ≈ 8.6 s`, matching the observed time.
 - Op‑level optimizations (depthwise SIMD, SiLU fusion, arena placement) each move the total by **~1%** — measurement noise against the conv compute.
 
-**The only meaningful speed lever is input resolution**, which is a model re‑export, not a compiler change:
+**Revisited (October 2026): memory, not MACs.** `428M ÷ ~50 MMAC/s` is 0.2 MAC a cycle, against the 16 the S3's vector MAC does. The im2col path read a layer's whole filter set for every output pixel (one byte per MAC) from a PSRAM scratch copy, and the S3 sees PSRAM through a 32 KB data cache: every layer whose filters are larger -- most of the compute -- ran at PSRAM bandwidth. The S3 convs now run in blocks of output channels whose filters fit in internal SRAM (see `esp_nn_conv_s8_simd.c`, "Fast buffer"); build with `-D FEMTO_PROFILE=1` to see each node's time on the board.
+
+Measured with that profiler on an ESP32-S3 N16R8, beside a camera's live view: 11 s -> **5.1 s** a run, of which convs 3.35 s, QuantizeLinear 0.44 s, Concat 0.29 s, SiLU 0.25 s, Transpose 0.17 s, the final Sigmoid 0.15 s, Split 0.11 s. Everything outside the convs was moving float tensors through PSRAM at ~40 MB/s. What followed: every plain conv on the ACCX path (the 1x1 QACC path cost more instructions per MAC), both cores, int8 instead of float where a tensor only goes through layout ops to a QuantizeLinear (`int8_layout_paths`), the final Sigmoid as tables. What remains of the float traffic is tensors read by a residual Add, or quantized at two different scales (a C2f split half feeding both the next conv and the concat): giving a producer one int8 output per scale is the next step there.
+
+Input resolution remains a lever on top of that, as a model re‑export, not a compiler change:
 
 | Input | Approx MACs | Approx time |
 |-------|-------------|-------------|
@@ -139,7 +143,7 @@ Inference is **~8.9 s at 256×256**, and this is **inherent, not a bug**:
 - **YOLOv5n** — complete and working (CNN, esp‑nn SIMD).
 - Together: a genuinely **model‑agnostic** ONNX→C compiler handling both CNNs and transformer‑attention detectors on a microcontroller.
 
-**Open validation:** confirm the ~0.5 confidence scores are the model's true output by comparing the final `output0` / score nodes against onnxruntime on the same image. Correct classes + fixed residuals strongly suggest ~0.5 is simply what int8 YOLO26 produces at 256×256; if ORT scores higher, one more drift source remains.
+**Resolved (October 2026): the ~0.5 confidence scores.** onnxruntime gives the same 0.500 on the same image, so it was not drift: the class-logit convs (`one2one_cv3.*.2`) carry an int8 output range of `[-255·s, 0]` (zero point 127) from calibration on mostly-background anchors, and every positive logit is clamped to 0, so sigmoid tops out at 0.5. `fuse.py`'s `widen_logit_range` moves that zero point to 0 (scale kept): scores below 0.5 are unchanged, above it they are real (people ~0.85-0.88, cups ~0.55-0.78 on the test image).
 
 ---
 

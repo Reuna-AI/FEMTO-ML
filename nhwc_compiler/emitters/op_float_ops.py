@@ -23,8 +23,9 @@ Contract: every activation is float32 EXCEPT the int8 in/out of a QLinearConv.
 Everything else is pure float32. Structural ops read static attrs from JSON.
 Signatures pass explicit buffers; shapes/attrs baked as literals.
 """
-from . import register
-from .common import fsan, san, wsan, numel, cfloat
+from . import register, REGISTRY
+from .lazy import is_lazy, sources, value, byte_of, begin as lazy_begin, prelude as lazy_prelude
+from .common import nearest_supported, fsan, san, wsan, numel, cfloat, quant_c, also_q, also_q_consts, also_q_stores, main_outputs
 
 def _sig(fn, args): return f"void {fn}({', '.join(args)})"
 _CDT={"int8":"int8_t","uint8":"uint8_t","int32":"int32_t","float32":"float","int64":"int64_t"}
@@ -67,16 +68,34 @@ def emit_dq(ctx,node):
     x=node["inputs"][0]; s=node["inputs"][1]; z=node["inputs"][2] if len(node["inputs"])>2 else None
     y=node["outputs"][0]; fn=fsan(node["name"]); n=numel(ctx.shape(x))
     sc=ctx.val0(s); zv=ctx.val0(z) if z is not None else 0
-    sig=_sig(fn,["const int8_t* x","float* y"]); ctx.header.append(sig+";")
+    to_int8 = ctx.T.get(y,{}).get("dtype")=="int8" and ctx.T[y].get("q_scale") is not None
+    then_sigmoid = bool(node["attrs"].get("then_sigmoid"))
+    sig=_sig(fn,["const int8_t* x", ("int8_t* y" if to_int8 else "float* y")]); ctx.header.append(sig+";")
     b=ctx.body
-    b.append(f"// DequantizeLinear {node['name']}")
+    b.append(f"// DequantizeLinear {node['name']}"
+             + ("  -> int8 at the next QuantizeLinear's scale (fuse.py int8_layout_paths)" if to_int8 else "")
+             + ("  -> sigmoid (fuse.py sigmoid_through_layout)" if then_sigmoid else ""))
     b.append(sig+" {")
     if sc is not None:
         b.append(f"  const float s={cfloat(sc)}; const int z={int(zv) if zv is not None else 0};")
     else:  # value not inlined -> read runtime array from weights.h
         zref=(wsan(z)+"[0]") if z is not None else "0"
         b.append(f"  const float s={wsan(s)}[0]; const int z={zref};")
-    b.append(f"  for(int i=0;i<{n};++i) y[i]=s*(float)((int)x[i]-z);")
+    if to_int8 or then_sigmoid:
+        # 256 inputs, so a table -- filled on the first run by the very expressions
+        # the separate ops used, hence the same values to the bit.
+        ty = "int8_t" if to_int8 else "float"
+        b.append(f"  static {ty} lut[256]; static int ready=0;")
+        b.append(f"  if(!ready){{")
+        if to_int8:
+            b.append(f"    const float inv=1.0f/{cfloat(ctx.T[y]['q_scale'])}; const int zo={int(ctx.T[y]['q_zp'])};")
+            b.append(f"    for(int q=-128;q<128;++q){{ float d=s*(float)(q-z); " + quant_c("lut[q+128]", "d", z="zo") + " }")
+        else:
+            b.append(f"    for(int q=-128;q<128;++q){{ float v=s*(float)(q-z); lut[q+128]=1.0f/(1.0f+expf(-v)); }}")
+        b.append(f"    ready=1; }}")
+        b.append(f"  for(int i=0;i<{n};++i) y[i]=lut[(unsigned char)(x[i]+128)];")
+    else:
+        b.append(f"  for(int i=0;i<{n};++i) y[i]=s*(float)((int)x[i]-z);")
     b.append("}"); b.append("")
     ctx.calls.append((node,fn,["x","y"]))
 
@@ -94,8 +113,12 @@ def emit_q(ctx,node):
     else:
         zref=(wsan(z)+"[0]") if z is not None else "0"
         b.append(f"  const float s={wsan(s)}[0]; const int z={zref};")
-    b.append(f"  for(int i=0;i<{n};++i){{ int r=(int)lroundf(x[i]/s)+z;")
-    b.append(f"    if(r<-128)r=-128; if(r>127)r=127; y[i]=(signed char)r; }}")
+    # One multiply by 1/s and an inline round half away from zero (lroundf's rule),
+    # rather than a float divide and a libm call per element: this is the commonest op
+    # in a QDQ graph (every conv input), and on an FPU without a divider each divide is
+    # a long instruction sequence. v is clamped first so the int conversion is defined.
+    b.append(f"  const float inv=1.0f/s;")
+    b.append(f"  for(int i=0;i<{n};++i) " + quant_c("y[i]", "x[i]"))
     b.append("}"); b.append("")
     ctx.calls.append((node,fn,["x","y"]))
 
@@ -110,6 +133,18 @@ def _unary(op, cexpr):
         b.append("}"); b.append("")
         ctx.calls.append((node,fn,["x","y"]))
 _unary("Sigmoid","1.0f/(1.0f+expf(-v))")
+_unary("Relu","v>0.0f?v:0.0f")
+_sigmoid_float = REGISTRY["Sigmoid"]
+
+@register("Sigmoid")
+def emit_sigmoid(ctx,node):
+    if not node["attrs"].get("identity"):
+        return _sigmoid_float(ctx,node)
+    x=node["inputs"][0]; y=node["outputs"][0]; fn=fsan(node["name"]); n=numel(ctx.shape(x))
+    sig=_sig(fn,["const float* x","float* y"]); ctx.header.append(sig+";")
+    b=ctx.body; b.append(f"// Sigmoid {node['name']}: done in its DequantizeLinears (fuse.py sigmoid_through_layout)")
+    b.append(sig+" {"); b.append(f"  if(y!=x) memcpy(y, x, {n}*sizeof(*x));")
+    b.append("}"); b.append(""); ctx.calls.append((node,fn,["x","y"]))
 
 @register("Pow")
 def emit_pow(ctx,node):
@@ -162,12 +197,18 @@ def emit_concat(ctx,node):
         else:
             # last resort: clamp into range so we at least don't index OOB
             if axis>=len(osh): axis=len(osh)-1
+    if ctx.T.get(outs,{}).get("dtype")=="int8":
+        return _emit_concat_int8(ctx,node,axis)
+    if any(is_lazy(ctx,i) for i in ins):
+        return _emit_concat_lazy(ctx,node,axis)
     # output is float; inputs may be float or int8(quantized) -> dequant per input
+    extra=also_q(node)
     args=[]
     for i,inp in enumerate(ins):
         ct = "int8_t" if _isq(ctx,inp) else _ct(ctx,inp)
         args.append("const "+ct+"* in"+str(i))
     args.append("float* y")
+    args += [f"int8_t* q{k}" for k in range(len(extra))]
     sig=_sig(fn,args); ctx.header.append(sig+";")
     b=ctx.body; b.append(f"// Concat {node['name']} axis={axis} of {len(ins)} (dequant int8 inputs)")
     b.append(sig+" {")
@@ -193,8 +234,24 @@ def emit_concat(ctx,node):
     inner=1
     for dax in osh_local[axis+1:]: inner*=dax
     b.append(f"  int outer={outer}, inner={inner}, off=0;")
+    if extra:
+        # and quantized for the QuantizeLinear(s) after it, as each value is placed
+        # (fuse.py fold_quantize_into_producer); the float only if anything else reads it
+        b.append("  " + also_q_consts(extra))
+        keep = not all(e.get("float_dead") for e in extra)
     for i,inp in enumerate(ins):
         ash=in_shapes[i]; ad=ash[axis] if axis<len(ash) else 1
+        if extra:
+            if _isq(ctx,inp):
+                sc,zp=_deq(ctx,inp); val=f"{cfloat(sc)}*(float)((int)in{i}[(o*ad+a)*inner+k]-({zp}))"
+            else:
+                val=f"in{i}[(o*ad+a)*inner+k]"
+            dst=f"(o*{cat_dim}+(off+a))*inner+k"
+            b.append(f"  {{ int ad={ad};")
+            b.append(f"    for(int o=0;o<outer;++o) for(int a=0;a<ad;++a) for(int k=0;k<inner;++k){{")
+            b.append(f"      float v={val}; " + (f"y[{dst}]=v; " if keep else "") + also_q_stores(extra, "v", dst) + " }")
+            b.append(f"    off+=ad; }}")
+            continue
         if _isq(ctx,inp):
             sc,zp=_deq(ctx,inp)
             b.append(f"  {{ int ad={ad}; const float s={cfloat(sc)}; const int z={zp};")
@@ -202,10 +259,96 @@ def emit_concat(ctx,node):
             b.append(f"      y[(o*{cat_dim}+(off+a))*inner+k]=s*(float)((int)in{i}[(o*ad+a)*inner+k]-z);")
             b.append(f"    off+=ad; }}")
         else:
+            # a run of ad*inner values per outer row: one memcpy, not a loop of three
             b.append(f"  {{ int ad={ad};")
-            b.append(f"    for(int o=0;o<outer;++o) for(int a=0;a<ad;++a) for(int k=0;k<inner;++k)")
-            b.append(f"      y[(o*{cat_dim}+(off+a))*inner+k]=in{i}[(o*ad+a)*inner+k];")
+            # (no copy where the input was made in its slab of y: gen_activations)
+            b.append(f"    for(int o=0;o<outer;++o) if(y+(o*{cat_dim}+off)*inner!=in{i}+o*ad*inner) memcpy(y+(o*{cat_dim}+off)*inner, in{i}+o*ad*inner, ad*inner*sizeof(*y));")
             b.append(f"    off+=ad; }}")
+    b.append("}"); b.append("")
+    ctx.calls.append((node,fn,list(ins)+[outs]+[e["dst"] for e in extra]))
+
+# Quantize a lazy Concat input whose values each come from one int8 byte through a
+# 256-entry table made on the first run (_emit_concat_lazy). False for the float
+# expression at every value, as before October 2026 (the same bytes either way).
+CONCAT_BYTE_TABLES = True
+
+def _byte_tables():
+    return CONCAT_BYTE_TABLES
+
+def _emit_concat_lazy(ctx,node,axis):
+    """A float channel Concat with lazy inputs (fuse.py mark_lazy_floats): each value
+    made from its int8 where it is placed, then stored and/or quantized as the plain
+    Concat does."""
+    outs=node["outputs"][0]; fn=fsan(node["name"]); ins=node["inputs"]
+    osh=ctx.shape(outs); C=osh[-1]; outer=numel(osh)//C
+    if axis!=len(osh)-1:
+        raise ValueError(f"Concat {node['name']}: a lazy input needs the channel axis, not {axis}")
+    extra=also_q(node)
+    keep = not (extra and all(e.get("float_dead") for e in extra))
+    srcs=[]
+    for i in ins:
+        for s_ in sources(ctx,i):
+            if s_ not in srcs: srcs.append(s_)
+    params={t:f"s{j}" for j,t in enumerate(srcs)}
+    lazy_begin(ctx)
+    vals=[value(ctx,i,"o","a",params) for i in ins]
+    # An input whose every value is made from one int8 byte, and only quantized here:
+    # its 256 possible bytes quantized once, by the same expressions, into a table
+    # filled on the first run -- then one lookup a value instead of a float table read,
+    # a multiply, a rounding and a clamp (the same bytes; CONCAT_BYTE_TABLES below).
+    bytes_=[byte_of(ctx,i,"o","a",params) if (extra and not keep and _byte_tables()) else None for i in ins]
+    args=[f"const {'int8_t' if ctx.T[t].get('dtype')=='int8' else 'float'}* s{j}" for j,t in enumerate(srcs)]
+    args.append("float* y"); args+=[f"int8_t* q{k}" for k in range(len(extra))]
+    sig=_sig(fn,args); ctx.header.append(sig+";")
+    b=ctx.body; b.append(f"// Concat {node['name']} axis={axis} of {len(ins)} (lazy floats made from their int8 here)")
+    b.append(sig+" {")
+    b.extend(lazy_prelude(ctx))
+    if extra: b.append("  " + also_q_consts(extra))
+    off=0
+    for i,inp in enumerate(ins):
+        ad=ctx.shape(inp)[-1]; dst=f"o*{C}+({off}+a)"
+        if bytes_[i]:
+            # the table in PSRAM (ARENA_ALLOC_PSRAM, once), not static: internal RAM is
+            # the wifi's; no memory for it, and the float loop below runs instead
+            read, made = bytes_[i]; nq=len(extra)
+            b.append(f"  static int8_t (*ct{i})[256]=0; static int ct{i}_state=0;   // byte table: 0 not made yet, 1 made, -1 no memory")
+            b.append(f"  if(!ct{i}_state){{ ct{i}=(int8_t(*)[256])ARENA_ALLOC_PSRAM({nq}*256); ct{i}_state=ct{i}?1:-1;")
+            b.append(f"    if(ct{i}) for(int bb=0;bb<256;++bb){{ float v={made('((int8_t)(bb-128))')}; "
+                     + " ".join(quant_c(f"ct{i}[{k}][bb]", "v", inv=f"inv{k}", z=f"z{k}") for k in range(nq)) + " } }")
+            b.append(f"  if(ct{i}) for(int o=0;o<{outer};++o) for(int a=0;a<{ad};++a){{ const unsigned char u_=(unsigned char)({read}+128); "
+                     + " ".join(f"q{k}[{dst}]=ct{i}[{k}][u_];" for k in range(nq)) + " }")
+            b.append(f"  else for(int o=0;o<{outer};++o) for(int a=0;a<{ad};++a){{ float v={vals[i]}; "
+                     + also_q_stores(extra, "v", dst) + " }")
+        else:
+            b.append(f"  for(int o=0;o<{outer};++o) for(int a=0;a<{ad};++a){{ float v={vals[i]}; "
+                     + (f"y[{dst}]=v; " if keep else "") + (also_q_stores(extra, "v", dst) if extra else "") + " }")
+        off+=ad
+    b.append("}"); b.append("")
+    ctx.calls.append((node,fn,srcs+[outs]+[e["dst"] for e in extra]))
+
+def _emit_concat_int8(ctx,node,axis):
+    """Concat whose inputs and output are int8 of one quantization (fuse.py
+    int8_layout_paths): a byte copy, a quarter of the float one's traffic."""
+    outs=node["outputs"][0]; fn=fsan(node["name"]); ins=node["inputs"]
+    osh=ctx.shape(outs); oq=(ctx.T[outs]["q_scale"], ctx.T[outs]["q_zp"])
+    for i in ins:
+        t=ctx.T.get(i,{})
+        if t.get("dtype")!="int8" or (t.get("q_scale"),t.get("q_zp"))!=oq:
+            raise ValueError(f"Concat {node['name']}: int8 output but input {i} is not int8 at {oq}")
+    args=[f"const int8_t* in{i}" for i in range(len(ins))]+["int8_t* y"]
+    sig=_sig(fn,args); ctx.header.append(sig+";")
+    b=ctx.body; b.append(f"// Concat {node['name']} axis={axis} of {len(ins)} (int8, one quantization)")
+    b.append(sig+" {")
+    outer=1
+    for dax in osh[:axis]: outer*=dax
+    inner=1
+    for dax in osh[axis+1:]: inner*=dax
+    cat=osh[axis]
+    b.append(f"  int off=0;")
+    for i,inp in enumerate(ins):
+        ad=ctx.shape(inp)[axis]
+        b.append(f"  for(int o=0;o<{outer};++o) if(y+(o*{cat}+off)*{inner}!=in{i}+o*{ad*inner}) memcpy(y+(o*{cat}+off)*{inner}, in{i}+o*{ad*inner}, {ad*inner});")
+        b.append(f"  off+={ad};")
     b.append("}"); b.append("")
     ctx.calls.append((node,fn,list(ins)+[outs]))
 
@@ -214,7 +357,8 @@ def emit_split(ctx,node):
     x=node["inputs"][0]; axis=node["attrs"].get("axis",0); fn=fsan(node["name"])
     xsh=ctx.shape(x); rank=len(xsh)
     if axis<0: axis+=rank
-    outs=node["outputs"]
+    outs=main_outputs(node)
+    extra=also_q(node)
     sizes=node["attrs"].get("split", None)
     if sizes is None and len(node["inputs"])>1:
         # opset-13+ Split: sizes are the 2nd input tensor (now inlined as a value)
@@ -222,8 +366,10 @@ def emit_split(ctx,node):
         if sv: sizes=[int(v) for v in sv]
     if sizes is None:
         each=xsh[axis]//len(outs); sizes=[each]*len(outs)
+    if is_lazy(ctx,x) or any(is_lazy(ctx,o) for o in outs):
+        return _emit_split_lazy(ctx,node,x,xsh,axis,outs,extra,sizes)
     ct=_ct(ctx,x)
-    args=[f"const {ct}* x"]+[f"{ct}* out{i}" for i in range(len(outs))]
+    args=[f"const {ct}* x"]+[f"{ct}* out{i}" for i in range(len(outs))]+[f"int8_t* q{k}" for k in range(len(extra))]
     sig=_sig(fn,args); ctx.header.append(sig+";")
     b=ctx.body; b.append(f"// Split {node['name']} axis={axis} sizes={sizes}"); b.append(sig+" {")
     outer=1
@@ -231,30 +377,87 @@ def emit_split(ctx,node):
     inner=1
     for d in xsh[axis+1:]: inner*=d
     b.append(f"  int outer={outer}, inner={inner}, off=0;")
+    if extra:
+        b.append("  " + also_q_consts(extra))
     for i,sz in enumerate(sizes):
-        b.append(f"  {{ int sd={sz}; for(int o=0;o<outer;++o) for(int a=0;a<sd;++a)")
-        b.append(f"      for(int k=0;k<inner;++k)")
-        b.append(f"        out{i}[(o*sd+a)*inner+k]=x[(o*{xsh[axis]}+(off+a))*inner+k];")
+        mine=[(k,e) for k,e in enumerate(extra) if e["src"]==outs[i]]
+        if mine:
+            # this part quantized as it is copied, for the QuantizeLinear(s) after it
+            keep = not all(e.get("float_dead") for _,e in mine)
+            stores=" ".join(quant_c(f"q{k}[o*sd*inner+j]", "v", inv=f"inv{k}", z=f"z{k}") for k,_ in mine)
+            b.append(f"  {{ int sd={sz}; for(int o=0;o<outer;++o) for(int j=0;j<sd*inner;++j){{")
+            b.append(f"      float v=x[(o*{xsh[axis]}+off)*inner+j]; " + (f"out{i}[o*sd*inner+j]=v; " if keep else "") + stores + " }")
+            b.append(f"    off+=sd; }}")
+            continue
+        b.append(f"  {{ int sd={sz}; for(int o=0;o<outer;++o)")
+        b.append(f"      memcpy(out{i}+o*sd*inner, x+(o*{xsh[axis]}+off)*inner, sd*inner*sizeof(*x));")
         b.append(f"    off+=sd; }}")
     b.append("}"); b.append("")
-    ctx.calls.append((node,fn,["x"]+[f"out{i}" for i in range(len(outs))]))
+    ctx.calls.append((node,fn,[x]+list(outs)+[e["dst"] for e in extra]))
+
+def _emit_split_lazy(ctx,node,x,xsh,axis,outs,extra,sizes):
+    """A channel Split with a lazy input or output (fuse.py mark_lazy_floats): each
+    value made from its int8 source(s) in the loop, the stored parts written as before,
+    the lazy ones not at all, and each folded QuantizeLinear's int8 as before."""
+    fn=fsan(node["name"]); C=xsh[-1]; outer=numel(xsh)//C
+    if axis!=len(xsh)-1:
+        raise ValueError(f"Split {node['name']}: a lazy tensor needs the channel axis, not {axis}")
+    srcs=sources(ctx,x); params={t:f"s{j}" for j,t in enumerate(srcs)}
+    stored=[(i,o) for i,o in enumerate(outs) if not is_lazy(ctx,o)]
+    args=[f"const {_ct(ctx,t) if not _isq(ctx,t) else 'int8_t'}* s{j}" for j,t in enumerate(srcs)]
+    args+=[f"float* out{i}" for i,_ in stored]+[f"int8_t* q{k}" for k in range(len(extra))]
+    sig=_sig(fn,args); ctx.header.append(sig+";")
+    b=ctx.body
+    lazy_begin(ctx)
+    vexpr=value(ctx,x,"o",f"off+j",params)   # tables first, above the function
+    b.append(f"// Split {node['name']} axis={axis} sizes={sizes} (lazy floats: made from their int8 here)"); b.append(sig+" {")
+    b.extend(lazy_prelude(ctx))
+    if extra:
+        b.append("  " + also_q_consts(extra))
+    off=0
+    for i,sz in enumerate(sizes):
+        o_name=outs[i]
+        mine=[(k,e) for k,e in enumerate(extra) if e["src"]==o_name]
+        write=not is_lazy(ctx,o_name) and not (mine and all(e.get("float_dead") for _,e in mine))
+        if not write and not mine:
+            off+=sz; continue
+        stores=" ".join(quant_c(f"q{k}[o*{sz}+j]", "v", inv=f"inv{k}", z=f"z{k}") for k,_ in mine)
+        b.append(f"  {{ const int off={off}; for(int o=0;o<{outer};++o) for(int j=0;j<{sz};++j){{")
+        b.append(f"      float v={vexpr}; " + (f"out{i}[o*{sz}+j]=v; " if write else "") + stores + " }")
+        b.append("    }")
+        off+=sz
+    b.append("}"); b.append("")
+    ctx.calls.append((node,fn,srcs+[o for _,o in stored]+[e["dst"] for e in extra]))
 
 # ---------------- Transpose (general N-D permute, static perm) ----------------
 @register("Transpose")
 def emit_transpose(ctx,node):
     x=node["inputs"][0]; y=node["outputs"][0]; fn=fsan(node["name"])
     xsh=ctx.shape(x); perm=node["attrs"].get("perm", list(range(len(xsh)-1,-1,-1)))
-    # robust: if shape unknown or perm doesn't match rank, emit an identity copy
-    if not xsh or any(p>=len(xsh) for p in perm):
-        n=numel(ctx.shape(y)) or numel(xsh) or 1
-        ct=_ct(ctx,x)
-        sig=_sig(fn,[f"const {ct}* x",f"{ct}* y"]); ctx.header.append(sig+";")
-        b=ctx.body; b.append(f"// Transpose {node['name']} (shape unknown -> copy; verify!)")
-        b.append(sig+" {"); b.append(f"  for(int i=0;i<{n};++i) y[i]=x[i];")
-        b.append("}"); b.append(""); ctx.calls.append((node,fn,["x","y"])); return
+    # A Transpose it cannot place is an error, not a copy: a copy is only right by luck.
+    # (graph_json now runs shape inference, and the NHWC pass no longer puts 4-D perms
+    # on other ranks, so a model this stops really has something unsupported.)
+    if not xsh or len(perm)!=len(xsh) or sorted(perm)!=list(range(len(xsh))):
+        raise ValueError(f"Transpose {node['name']}: perm {perm} does not fit input shape {xsh}")
     ysh=[xsh[p] for p in perm]; n=numel(xsh)
     xstr=_strides(xsh); ystr=_strides(ysh)
     ct=_ct(ctx,x)
+    blocks=_as_2d_transpose(xsh, perm)
+    if blocks:
+        batch, A, B = blocks
+        sig=_sig(fn,[f"const {ct}* x",f"{ct}* y"]); ctx.header.append(sig+";")
+        b=ctx.body; b.append(f"// Transpose {node['name']} perm={perm}: [{batch}][{A}][{B}] -> [{batch}][{B}][{A}], in tiles")
+        b.append(sig+" {")
+        # Element by element, one side of a transpose strides through memory a value at a
+        # time -- on an MCU, a PSRAM cache line fetched for each value written. In
+        # 16 x 16 tiles both sides stay within a few lines.
+        b.append(f"  const int A={A}, B={B}, T=16;")
+        b.append(f"  for(int n=0;n<{batch};++n){{ const {ct}* xb=x+n*A*B; {ct}* yb=y+n*A*B;")
+        b.append(f"    for(int a0=0;a0<A;a0+=T) for(int b0=0;b0<B;b0+=T){{")
+        b.append(f"      const int a1=a0+T<A?a0+T:A, b1=b0+T<B?b0+T:B;")
+        b.append(f"      for(int a=a0;a<a1;++a) for(int c=b0;c<b1;++c) yb[c*A+a]=xb[a*B+c]; }} }}")
+        b.append("}"); b.append("")
+        ctx.calls.append((node,fn,["x","y"])); return
     sig=_sig(fn,[f"const {ct}* x",f"{ct}* y"]); ctx.header.append(sig+";")
     b=ctx.body; b.append(f"// Transpose {node['name']} perm={perm}"); b.append(sig+" {")
     # emit nested loops over output index, map to input via perm
@@ -268,6 +471,19 @@ def emit_transpose(ctx,node):
     b.append("}"); b.append("")
     ctx.calls.append((node,fn,["x","y"]))
 
+def _as_2d_transpose(shape, perm):
+    """(batch, A, B) when [perm] keeps some leading dims and swaps the two groups of dims
+    after them -- NHWC <-> NCHW, a matrix's last two axes -- so the transpose is of a
+    batch of A x B matrices; else None."""
+    k=0
+    while k<len(perm) and perm[k]==k: k+=1
+    rest=perm[k:]; r=len(perm)
+    for m in range(k+1, r):
+        if rest==list(range(m, r))+list(range(k, m)):
+            batch=numel(shape[:k]) if k else 1
+            return batch, numel(shape[k:m]), numel(shape[m:])
+    return None
+
 # ---------------- Reshape (pure copy; layout identical) ----------------
 @register("Reshape")
 def emit_reshape(ctx,node):
@@ -275,7 +491,7 @@ def emit_reshape(ctx,node):
     ct=_ct(ctx,x)
     sig=_sig(fn,[f"const {ct}* x",f"{ct}* y"]); ctx.header.append(sig+";")
     b=ctx.body; b.append(f"// Reshape {node['name']} (memcpy)"); b.append(sig+" {")
-    b.append(f"  for(int i=0;i<{n};++i) y[i]=x[i];")
+    b.append(f"  if(y!=x) memcpy(y, x, {n}*sizeof(*x));")
     b.append("}"); b.append(""); ctx.calls.append((node,fn,["x","y"]))
 
 # ---------------- MaxPool (NHWC, static kernel/stride) ----------------
@@ -320,6 +536,10 @@ def emit_resize(ctx,node):
     }
   }""")
     else:
+        if not nearest_supported(a,H,W,Ho,Wo):
+            raise ValueError(f"Resize {node['name']}: nearest {H}x{W}->{Ho}x{Wo} with "
+                             f"coordinate_transformation_mode={a.get('coordinate_transformation_mode')}, "
+                             f"nearest_mode={a.get('nearest_mode')} is not what this emitter computes")
         b.append("""  for(int oh=0;oh<Ho;++oh)for(int ow=0;ow<Wo;++ow){
     int sy=(int)(oh*ry), sx=(int)(ow*rx); if(sy>=H)sy=H-1; if(sx>=W)sx=W-1;
     for(int c=0;c<C;++c) y[(oh*Wo+ow)*C+c]=x[(sy*W+sx)*C+c];
@@ -385,23 +605,75 @@ def emit_add(ctx, node):
         bd=ctx.body; bd.append("// Add "+node["name"]+" (x + file const)"); bd.append(sig+" {")
         bd.append("  for(int i=0;i<"+str(ny)+";++i) y[i]=a[i]+b[i%"+str(nb)+"];")
         bd.append("}"); bd.append(""); ctx.calls.append((node,fn,[a,b,y]))
+    elif is_lazy(ctx,a) or is_lazy(ctx,b) or is_lazy(ctx,y):
+        _emit_add_lazy(ctx,node,a,b,y,fn)
     else:
         nb=max(1,numel(ctx.shape(b)))
         aq=_isq(ctx,a); bq=_isq(ctx,b)
         act = "int8_t" if aq else ct
         bct = "int8_t" if bq else _ct(ctx,b)
-        sig=_sig(fn,["const "+act+"* a","const "+bct+"* b", "float* y"]); ctx.header.append(sig+";")
-        bd=ctx.body; bd.append("// Add "+node["name"]+" (elementwise, dequant if q)"); bd.append(sig+" {")
+        yq = ctx.T.get(y,{}).get("dtype")=="int8" and ctx.T[y].get("q_scale") is not None
+        extra=also_q(node)
+        sig=_sig(fn,["const "+act+"* a","const "+bct+"* b", ("int8_t* y" if yq else "float* y")]
+                 +[f"int8_t* q{k}" for k in range(len(extra))]); ctx.header.append(sig+";")
+        bd=ctx.body; bd.append("// Add "+node["name"]+" (elementwise, dequant if q"+(", int8 out" if yq else "")+")"); bd.append(sig+" {")
+        ia = "i" if na==ny else f"i%{na}"
+        ib = "i" if nb==ny else f"i%{nb}"
         if aq:
-            sca,zpa=_deq(ctx,a); av=f"({cfloat(sca)}*(float)((int)a[i%{na}] - ({zpa})))"
+            sca,zpa=_deq(ctx,a); av=f"({cfloat(sca)}*(float)((int)a[{ia}] - ({zpa})))"
         else:
-            av=f"a[i%{na}]"
+            av=f"a[{ia}]"
         if bq:
-            scb,zpb=_deq(ctx,b); bv=f"({cfloat(scb)}*(float)((int)b[i%{nb}] - ({zpb})))"
+            scb,zpb=_deq(ctx,b); bv=f"({cfloat(scb)}*(float)((int)b[{ib}] - ({zpb})))"
         else:
-            bv=f"b[i%{nb}]"
-        bd.append(f"  for(int i=0;i<{ny};++i) y[i]={av}+{bv};")
-        bd.append("}"); bd.append(""); ctx.calls.append((node,fn,[a,b,y]))
+            bv=f"b[{ib}]"
+        if yq:
+            # the float sum, quantized as the QuantizeLinear after it did (fuse.py int8_layout_paths)
+            bd.append(f"  const float inv=1.0f/{cfloat(ctx.T[y]['q_scale'])}; const int z={int(ctx.T[y]['q_zp'])};")
+            bd.append(f"  for(int i=0;i<{ny};++i){{ float sum={av}+{bv}; " + quant_c("y[i]", "sum") + " }")
+        elif extra:
+            # and quantized for the QuantizeLinear(s) after it, in the same pass
+            keep = not all(e.get("float_dead") for e in extra)
+            bd.append("  " + also_q_consts(extra))
+            bd.append(f"  for(int i=0;i<{ny};++i){{ float sum={av}+{bv}; " + ("y[i]=sum; " if keep else "")
+                      + also_q_stores(extra, "sum", "i") + " }")
+        else:
+            bd.append(f"  for(int i=0;i<{ny};++i) y[i]={av}+{bv};")
+        bd.append("}"); bd.append(""); ctx.calls.append((node,fn,[a,b,y]+[e["dst"] for e in extra]))
+
+
+def _emit_add_lazy(ctx,node,a,b,y,fn):
+    """A same-shape Add with a lazy input or output (fuse.py mark_lazy_floats): each
+    input made from its int8 in the loop, the float sum as the plain Add makes it,
+    stored only if y is not lazy, and quantized for whatever was folded into it."""
+    ysh=ctx.shape(y); C=ysh[-1]; outer=numel(ysh)//C
+    if ctx.shape(a)!=ysh or ctx.shape(b)!=ysh:
+        raise ValueError(f"Add {node['name']}: a lazy tensor needs equal shapes")
+    yq = ctx.T.get(y,{}).get("dtype")=="int8" and ctx.T[y].get("q_scale") is not None
+    extra=also_q(node); ylazy=is_lazy(ctx,y)
+    srcs=[]
+    for t in (a,b):
+        for s_ in sources(ctx,t):
+            if s_ not in srcs: srcs.append(s_)
+    params={t:f"s{j}" for j,t in enumerate(srcs)}
+    lazy_begin(ctx)
+    av=value(ctx,a,"o","c",params); bv=value(ctx,b,"o","c",params)
+    args=[f"const {'int8_t' if ctx.T[t].get('dtype')=='int8' else 'float'}* s{j}" for j,t in enumerate(srcs)]
+    if not ylazy: args.append("int8_t* y" if yq else "float* y")
+    args+=[f"int8_t* q{k}" for k in range(len(extra))]
+    sig=_sig(fn,args); ctx.header.append(sig+";")
+    bd=ctx.body; bd.append("// Add "+node["name"]+" (elementwise; lazy floats made from their int8 here)"); bd.append(sig+" {")
+    bd.extend(lazy_prelude(ctx))
+    if yq:
+        bd.append(f"  const float inv=1.0f/{cfloat(ctx.T[y]['q_scale'])}; const int z={int(ctx.T[y]['q_zp'])};")
+        bd.append(f"  for(int o=0;o<{outer};++o) for(int c=0;c<{C};++c){{ const int i=o*{C}+c; float sum={av}+{bv}; " + quant_c("y[i]", "sum") + " }")
+    else:
+        keep = not ylazy and not (extra and all(e.get("float_dead") for e in extra))
+        if extra: bd.append("  " + also_q_consts(extra))
+        bd.append(f"  for(int o=0;o<{outer};++o) for(int c=0;c<{C};++c){{ const int i=o*{C}+c; float sum={av}+{bv}; "
+                  + ("y[i]=sum; " if keep else "") + (also_q_stores(extra, "sum", "i") if extra else "") + " }")
+    bd.append("}"); bd.append("")
+    ctx.calls.append((node,fn,srcs+([] if ylazy else [y])+[e["dst"] for e in extra]))
 
 
 # ============================================================================
@@ -663,12 +935,13 @@ def emit_flatten(ctx, node):
     x = node["inputs"][0]; y = node["outputs"][0]; fn = fsan(node["name"])
     n = numel(ctx.shape(x)) or numel(ctx.shape(y)) or 1
     xi = _is_int_tensor(ctx, x)
-    ct = "int32_t" if xi else "float"
-    if y in ctx.T: ctx.T[y]["dtype"] = "int32" if xi else "float32"
+    i8 = ctx.T.get(x, {}).get("dtype") in ("int8", "uint8")   # quantized bytes stay bytes
+    ct = _ct(ctx, x) if i8 else ("int32_t" if xi else "float")
+    if y in ctx.T and not i8: ctx.T[y]["dtype"] = "int32" if xi else "float32"
     sig = _sig(fn, [f"const {ct}* x", f"{ct}* y"])
     ctx.header.append(sig+";")
     b = ctx.body; b.append(f"// Flatten {node['name']} n={n} (copy)")
-    b.append(sig+" {"); b.append(f"  for(int i=0;i<{n};++i) y[i]=x[i];")
+    b.append(sig+" {"); b.append(f"  if(y!=x) memcpy(y, x, {n}*sizeof(*x));")
     b.append("}"); b.append("")
     ctx.calls.append((node, fn, [x, y]))
 
@@ -679,12 +952,30 @@ def emit_unsqueeze(ctx, node):
     x = node["inputs"][0]; y = node["outputs"][0]; fn = fsan(node["name"])
     n = numel(ctx.shape(x)) or numel(ctx.shape(y)) or 1
     xi = _is_int_tensor(ctx, x)
-    ct = "int32_t" if xi else "float"
-    if y in ctx.T: ctx.T[y]["dtype"] = "int32" if xi else "float32"
+    i8 = ctx.T.get(x, {}).get("dtype") in ("int8", "uint8")   # quantized bytes stay bytes
+    ct = _ct(ctx, x) if i8 else ("int32_t" if xi else "float")
+    if y in ctx.T and not i8: ctx.T[y]["dtype"] = "int32" if xi else "float32"
     sig = _sig(fn, [f"const {ct}* x", f"{ct}* y"])
     ctx.header.append(sig+";")
     b = ctx.body; b.append(f"// Unsqueeze {node['name']} n={n} (copy)")
-    b.append(sig+" {"); b.append(f"  for(int i=0;i<{n};++i) y[i]=x[i];")
+    b.append(sig+" {"); b.append(f"  if(y!=x) memcpy(y, x, {n}*sizeof(*x));")
+    b.append("}"); b.append("")
+    ctx.calls.append((node, fn, [x, y]))
+
+
+@register("Squeeze")
+def emit_squeeze(ctx, node):
+    """Squeeze: drop size-1 dims. Data unchanged -> copy."""
+    x = node["inputs"][0]; y = node["outputs"][0]; fn = fsan(node["name"])
+    n = numel(ctx.shape(x)) or numel(ctx.shape(y)) or 1
+    xi = _is_int_tensor(ctx, x)
+    i8 = ctx.T.get(x, {}).get("dtype") in ("int8", "uint8")   # quantized bytes stay bytes
+    ct = _ct(ctx, x) if i8 else ("int32_t" if xi else "float")
+    if y in ctx.T and not i8: ctx.T[y]["dtype"] = "int32" if xi else "float32"
+    sig = _sig(fn, [f"const {ct}* x", f"{ct}* y"])
+    ctx.header.append(sig+";")
+    b = ctx.body; b.append(f"// Squeeze {node['name']} n={n} (copy)")
+    b.append(sig+" {"); b.append(f"  if(y!=x) memcpy(y, x, {n}*sizeof(*x));")
     b.append("}"); b.append("")
     ctx.calls.append((node, fn, [x, y]))
 
@@ -698,8 +989,9 @@ def emit_expand(ctx, node):
     xsh = ctx.shape(x); ysh = ctx.shape(y)
     nx = numel(xsh) or 1; nyt = numel(ysh) or 1
     xi = _is_int_tensor(ctx, x)
-    ct = "int32_t" if xi else "float"
-    if y in ctx.T: ctx.T[y]["dtype"] = "int32" if xi else "float32"
+    i8 = ctx.T.get(x, {}).get("dtype") in ("int8", "uint8")   # quantized bytes stay bytes
+    ct = _ct(ctx, x) if i8 else ("int32_t" if xi else "float")
+    if y in ctx.T and not i8: ctx.T[y]["dtype"] = "int32" if xi else "float32"
     sig = _sig(fn, [f"const {ct}* x", f"{ct}* y"])
     ctx.header.append(sig+";")
     b = ctx.body
@@ -737,8 +1029,9 @@ def emit_reducemax(ctx, node):
     inner = 1
     for d in xsh[axis+1:]: inner *= d
     xi = _is_int_tensor(ctx, x)
-    ct = "int32_t" if xi else "float"
-    if y in ctx.T: ctx.T[y]["dtype"] = "int32" if xi else "float32"
+    i8 = ctx.T.get(x, {}).get("dtype") in ("int8", "uint8")   # quantized bytes stay bytes
+    ct = _ct(ctx, x) if i8 else ("int32_t" if xi else "float")
+    if y in ctx.T and not i8: ctx.T[y]["dtype"] = "int32" if xi else "float32"
     sig = _sig(fn, [f"const {ct}* x", f"{ct}* y"])
     ctx.header.append(sig+";")
     b = ctx.body; b.append(f"// ReduceMax {node['name']} axis={axis} ad={ad}")
@@ -777,6 +1070,42 @@ def emit_topk(ctx, node):
     b.append(f"// TopK {node['name']} axis={axis} K={K} ad={ad} outer={outer} (largest,sorted)")
     b.append(sig+" {")
     b.append(f"  const int OUTER={outer}, AD={ad}, K={K};")
+    if ad >= K:
+        # A K-entry heap, worst at the root: one pass over AD, K*log K to sort,
+        # instead of K passes over AD (YOLO26's class TopK: 24000 x 300). Ranked
+        # exactly as repeated max ranks: higher value first, a tie to the lower index.
+        b.append(f"  static float hv[{K}]; static int32_t hi[{K}];")
+        b.append(f"  #define TK_WORSE(i,j) (hv[i]<hv[j] || (hv[i]==hv[j] && hi[i]>hi[j]))")
+        b.append(f"  for(int o=0;o<OUTER;++o){{")
+        b.append(f"    const {ct}* xo=x+o*AD; int n=0;")
+        b.append(f"    for(int a=0;a<AD;++a){{ float v=(float)xo[a];")
+        b.append(f"      if(n<K){{ int c=n++; hv[c]=v; hi[c]=a;")
+        b.append(f"        while(c>0){{ int p=(c-1)/2; if(!TK_WORSE(c,p)) break;")
+        b.append(f"          float tv=hv[c]; hv[c]=hv[p]; hv[p]=tv; int32_t ti=hi[c]; hi[c]=hi[p]; hi[p]=ti; c=p; }}")
+        b.append(f"        continue; }}")
+        b.append(f"      if(!(v>hv[0])) continue;   /* a tie loses: its index is higher */")
+        b.append(f"      hv[0]=v; hi[0]=a; int c=0;")
+        b.append(f"      for(;;){{ int l=2*c+1, r=l+1, m=c;")
+        b.append(f"        if(l<K && TK_WORSE(l,m)) m=l;")
+        b.append(f"        if(r<K && TK_WORSE(r,m)) m=r;")
+        b.append(f"        if(m==c) break;")
+        b.append(f"        float tv=hv[c]; hv[c]=hv[m]; hv[m]=tv; int32_t ti=hi[c]; hi[c]=hi[m]; hi[m]=ti; c=m; }}")
+        b.append(f"    }}")
+        b.append(f"    /* pop the worst into the last place, K times: best first */")
+        b.append(f"    for(int last=K-1; last>=0; --last){{")
+        b.append(f"      vals[o*K+last]=hv[0]; idx[o*K+last]=hi[0];")
+        b.append(f"      hv[0]=hv[last]; hi[0]=hi[last]; int c=0;")
+        b.append(f"      for(;;){{ int l=2*c+1, r=l+1, m=c;")
+        b.append(f"        if(l<last && TK_WORSE(l,m)) m=l;")
+        b.append(f"        if(r<last && TK_WORSE(r,m)) m=r;")
+        b.append(f"        if(m==c) break;")
+        b.append(f"        float tv=hv[c]; hv[c]=hv[m]; hv[m]=tv; int32_t ti=hi[c]; hi[c]=hi[m]; hi[m]=ti; c=m; }}")
+        b.append(f"    }}")
+        b.append(f"  }}")
+        b.append(f"  #undef TK_WORSE")
+        b.append("}"); b.append("")
+        ctx.calls.append((node, fn, [x, vals_out, idx_out]))
+        return
     b.append(f"  for(int o=0;o<OUTER;++o){{")
     b.append(f"    /* simple selection of top-K by repeated max (K<<AD) */")
     b.append(f"    static char used[{ad}];")

@@ -137,7 +137,10 @@ def main():
     m=expose_outputs(m, want)
     tmp="_ort_exposed.onnx"; onnx.save(m, tmp)
 
-    sess=ort.InferenceSession(tmp, providers=["CPUExecutionProvider"])
+    # The model as written, op by op: onnxruntime's graph optimizations rewrite QDQ
+    # pairs (and its QDQ propagation rejects some quantized models outright).
+    so=ort.SessionOptions(); so.graph_optimization_level=ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    sess=ort.InferenceSession(tmp, sess_options=so, providers=["CPUExecutionProvider"])
     iname=sess.get_inputs()[0].name
     ishape=[d if isinstance(d,int) else 1 for d in sess.get_inputs()[0].shape]
 

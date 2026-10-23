@@ -77,7 +77,7 @@ def _emit_espnn_call(ctx, node, K,Kh,Kw,Cp,H,W,Ho,Wo,sh,sw,pt,pl,XS,XZ,YS,YZ,WSC
     b.append(f"      .stride={{{sw},{sh}}}, .padding={{{pl},{pt}}}, .dilation={{1,1}},")
     b.append(f"      .activation={{-128,127}} }};")
     b.append(f"  quant_data_t qd={{ .shift=sft, .mult=mlt }};")
-    b.append(f"  esp_nn_conv_s8_simd(&id, x, &fd, w, bias, &od, y, &cp, &qd);")
+    b.extend(_lut_call(ctx, node, "  esp_nn_conv_s8_simd(&id, x, &fd, w, bias, &od, y, &cp, &qd);"))
     b.append("}"); b.append("")
     ctx.calls.append((node, fn))
 
@@ -104,7 +104,7 @@ def _emit_dw_espnn_call(ctx, node, K,Kh,Kw,H,W,Ho,Wo,sh,sw,pt,pl,XS,XZ,YS,YZ,WSC
     b.append(f"      .stride={{{sw},{sh}}}, .padding={{{pl},{pt}}}, .dilation={{1,1}},")
     b.append(f"      .activation={{-128,127}} }};")
     b.append(f"  quant_data_t qd={{ .shift=sft, .mult=mlt }};")
-    b.append(f"  esp_nn_depthwise_conv_s8_simd(&id, x, &fd, w, bias, &od, y, &cp, &qd);")
+    b.extend(_lut_call(ctx, node, "  esp_nn_depthwise_conv_s8_simd(&id, x, &fd, w, bias, &od, y, &cp, &qd);"))
     b.append("}"); b.append("")
     ctx.calls.append((node, fn))
 
@@ -133,6 +133,7 @@ def _emit_depthwise(ctx, node, K,Kh,Kw,H,W,Ho,Wo,sh,sw,pt,pl,XS,XZ,YS,YZ,WSC,bia
     b.append(f"  const int sh={sh},sw={sw},pt={pt},pl={pl}; const int X_ZP={XZ},Y_ZP={YZ};")
     b.append(f"  static const int32_t mlt[{K}]={{{mi_str}}};")
     b.append(f"  static const int32_t sft[{K}]={{{si_str}}};")
+    b.extend(_lut_decl(ctx, node, "  "))
     b.append(f"  for(int k=0;k<K;++k){{")
     b.append(f"    long sw_=0; for(int kh=0;kh<Kh;++kh)for(int kw=0;kw<Kw;++kw) sw_+=w[(kh*Kw+kw)*K+k];")
     b.append(f"    int adj=(bias?bias[k]:0) - X_ZP*(int)sw_;")
@@ -147,11 +148,35 @@ def _emit_depthwise(ctx, node, K,Kh,Kw,H,W,Ho,Wo,sh,sw,pt,pl,XS,XZ,YS,YZ,WSC,bia
     b.append(f"      }}")
     b.append(f"      int r=_tflm_requant(acc, mlt[k], sft[k]) + Y_ZP;")
     b.append(f"      if(r<-128)r=-128; if(r>127)r=127;")
-    b.append(f"      y[(oh*Wo+ow)*K+k]=(signed char)r;")
+    b.append(f"      y[(oh*Wo+ow)*K+k]=" + ("silu_lut[r+128];" if _silu_lut(ctx, node) else "(signed char)r;"))
     b.append(f"    }}")
     b.append(f"  }}")
     b.append("}"); b.append("")
     ctx.calls.append((node, fn))
+
+def _silu_lut(ctx, node):
+    """The int8 table of a SiLU fuse.py folded into this conv, or None."""
+    s = node["attrs"].get("silu")
+    if not s:
+        return None
+    from .op_silu import silu_i8_table
+    is_ = ctx.val0(s["in_scale"]); os_ = ctx.val0(s["out_scale"])
+    if is_ is None or os_ is None:
+        raise ValueError(f"QLinearConv {node['name']}: its folded SiLU's scales are not inlined")
+    return silu_i8_table(is_, int(ctx.val0(s["in_zp"])), os_, int(ctx.val0(s["out_zp"])))
+
+def _lut_decl(ctx, node, indent):
+    lut = _silu_lut(ctx, node)
+    if not lut:
+        return []
+    return [f"{indent}static const int8_t silu_lut[256]={{{', '.join(str(v) for v in lut)}}};   // its SiLU, folded in"]
+
+def _lut_call(ctx, node, call):
+    """The kernel call, with the folded SiLU's table set around it if there is one."""
+    if not _silu_lut(ctx, node):
+        return [call]
+    return _lut_decl(ctx, node, "  ") + ["  esp_nn_conv_s8_simd_set_out_lut(silu_lut);", call,
+                                         "  esp_nn_conv_s8_simd_set_out_lut(0);"]
 
 _REQUANT_HELPER = """
 // --- TFLite integer requant (matches esp-nn / onnxruntime) ---
@@ -264,11 +289,18 @@ def emit(ctx, node):
     b.append(f"    adj[k]=(bias?bias[k]:0)-X_ZP*s; }} prep=1; }}")
 
     if ctx.target=="ansi_float":
-        b.append(_body_ansi_float(XS,XZ,YS,YZ))
+        body=_body_ansi_float(XS,XZ,YS,YZ)
     else:
         # scalar int8: correct and alignment-free. Used for esp32s3 when Cp%16!=0,
         # for esp32s3 without --simd, and for ansi_int8.
-        b.append(_body_ansi_int())
+        body=_body_ansi_int()
+    if _silu_lut(ctx, node):
+        # the SiLU folded in (fuse.py fold_silu_into_conv): each byte through its table
+        b.extend(_lut_decl(ctx, node, "  "))
+        store="y[(oh*Wo+ow)*K+k]=(signed char)r;"
+        assert body.count(store)==1
+        body=body.replace(store, "y[(oh*Wo+ow)*K+k]=silu_lut[r+128];")
+    b.append(body)
     b.append("}"); b.append("")
 
     # driver call
@@ -342,7 +374,7 @@ def _body_ansi_float(XS,XZ,YS,YZ):
           accf+=xf*wf;
         }}
       }}}}
-    if(bias) accf+=YS*0; // bias handled in int domain normally; float path is reference-only
+    if(bias) accf+=(float)bias[k]*mult[k]*YS;  // the int32 bias is at scale XS*w_scale[k]
     int r=(int)lroundf(accf/YS)+YZ; if(r<-128)r=-128; if(r>127)r=127;
     y[(oh*Wo+ow)*K+k]=(signed char)r;
   }}"""

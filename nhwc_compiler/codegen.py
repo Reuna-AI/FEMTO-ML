@@ -31,7 +31,7 @@ import sys, os, json, argparse, importlib, pkgutil
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import emitters
 from emitters import REGISTRY
-from emitters.common import EmitCtx, san, wsan
+from emitters.common import EmitCtx, san, wsan, cfloat, quant_c
 
 def load_all():
     for _,name,_ in pkgutil.iter_modules(emitters.__path__):
@@ -61,10 +61,23 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
         else: skipped[n["op"]]=skipped.get(n["op"],0)+1
 
     base=out_base.split("/")[-1].split("\\")[-1]
+
+    # A model that quantizes its float NCHW input and transposes it to NHWC before
+    # anything else: the caller can write that int8 NHWC tensor itself (one byte a
+    # value, not four, straight from its camera's pixels) and skip both.
+    skip_input=None
+    if len(ctx.calls)>=2:
+        q=ctx.calls[0][0]; t=ctx.calls[1][0]
+        if (q["op"]=="QuantizeLinear" and d.get("inputs") and q["inputs"][0]==d["inputs"][0]
+                and t["op"]=="Transpose" and t["inputs"][0]==q["outputs"][0]
+                and t["attrs"].get("perm")==[0,2,3,1] and len(ctx.shape(t["outputs"][0]))==4
+                and ctx.val0(q["inputs"][1]) is not None):
+            zq=ctx.val0(q["inputs"][2]) if len(q["inputs"])>2 else 0
+            skip_input=(t["outputs"][0], float(ctx.val0(q["inputs"][1])), int(zq or 0))
     # ---- header ----
     with open(out_base+".h","w",encoding="utf-8") as h:
         h.write("// Auto-generated model header. Do not edit.\n#pragma once\n")
-        h.write("#include <stdint.h>\n#include <math.h>\n")
+        h.write("#include <stdint.h>\n#include <string.h>\n#include <math.h>\n")
         h.write('#include "weights.h"\n#include "activations.h"\n\n')
         h.write(f"// target: {target}\n")
         if target=="esp32s3" and (debug or dump):
@@ -76,13 +89,39 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
         h.write(f"#ifndef DEBUG_DUMP\n#define DEBUG_DUMP {1 if (target=='esp32s3' and dump) else 0}\n#endif\n")
         h.write(f"#ifndef DUMP_N\n#define DUMP_N {dump_n}\n#endif\n")
         h.write("#ifndef MODEL_DEBUG\n#define MODEL_DEBUG %d\n#endif\n" % (1 if debug else 0))
+        # FEMTO_PROFILE=1 (a -D flag, nothing regenerated): time every node with
+        # femto_profile.c and report by op type and slowest node.
+        h.write("#ifndef FEMTO_PROFILE\n#define FEMTO_PROFILE 0\n#endif\n")
         h.write("#if MODEL_DEBUG\n  #include <stdio.h>\n")
         h.write("  #define DBG_NODE(i,op,name) printf(\"[%d] %s %s\\n\",(i),(op),(name))\n")
         h.write("  #define DBG_STAT(name,ptr,n,isf) dbg_stat((name),(ptr),(n),(isf))\n")
-        h.write("#else\n  #define DBG_NODE(i,op,name)\n  #define DBG_STAT(name,ptr,n,isf)\n#endif\n")
+        h.write("  #define DBG_END()\n")
+        h.write("#elif FEMTO_PROFILE\n  #include \"femto_profile.h\"\n")
+        h.write("  #define DBG_NODE(i,op,name) femto_prof_node((i),(op),(name))\n")
+        h.write("  #define DBG_STAT(name,ptr,n,isf)\n")
+        h.write("  #define DBG_END() femto_prof_end()\n")
+        h.write("#else\n  #define DBG_NODE(i,op,name)\n  #define DBG_STAT(name,ptr,n,isf)\n  #define DBG_END()\n#endif\n")
         h.write("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
         for line in ctx.header: h.write(line+"\n")
-        h.write("\nvoid run_model(void);\n")
+        # FEMTO_NO_FLOAT_INPUT: the float input is never allocated (activations.c), so only
+        # run_model_int8_input() can run -- and only a model that has one may be built that way.
+        h.write("\n#ifndef FEMTO_NO_FLOAT_INPUT\nvoid run_model(void);\n#endif\n")
+        if not skip_input:
+            h.write("#ifdef FEMTO_NO_FLOAT_INPUT\n#error \"this model has no int8 input to write: build it without FEMTO_NO_FLOAT_INPUT\"\n#endif\n")
+        if skip_input:
+            name, sc, zp = skip_input
+            _,H,W,C = ctx.shape(name)
+            h.write("\n/* The input as the first conv reads it: int8, [H][W][C], quantized as below.\n")
+            h.write(" * Fill it (model_quantize_input() is the model's own QuantizeLinear) and call\n")
+            h.write(" * run_model_int8_input() in place of filling the float input and run_model(). */\n")
+            h.write("#define MODEL_INPUT_INT8 1\n")
+            h.write(f"#define MODEL_INPUT_H {H}\n#define MODEL_INPUT_W {W}\n#define MODEL_INPUT_C {C}\n")
+            h.write(f"#define MODEL_INPUT_SCALE {cfloat(sc)}\n#define MODEL_INPUT_ZP {zp}\n")
+            h.write(f"#define model_input_int8 ((int8_t*){san(name)})\n")
+            h.write("static inline int8_t model_quantize_input(float x) {\n")
+            h.write("  const float inv=1.0f/MODEL_INPUT_SCALE; const int z=MODEL_INPUT_ZP; int8_t y;\n")
+            h.write("  " + quant_c("y", "x") + "\n  return y;\n}\n")
+            h.write("void run_model_int8_input(void);\n")
         h.write("\n#ifdef __cplusplus\n}\n#endif\n")
 
     # ---- body + driver ----
@@ -140,7 +179,7 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
         c.write("#define DUMP_I8(nm,p,H,W,C,sc,zp,nchw) dump_i8(nm,(const signed char*)(p),H,W,C,sc,zp,nchw)\n")
         c.write("#define DUMP_F(nm,p,H,W,C,nchw) dump_f(nm,(const float*)(p),H,W,C,nchw)\n")
         c.write("#else\n#define DUMP_I8(nm,p,H,W,C,sc,zp,nchw)\n#define DUMP_F(nm,p,H,W,C,nchw)\n#define DUMP_FLAT_I8(nm,p,C,per,sc,zp)\n#define DUMP_FLAT_F(nm,p,C,per)\n#endif\n\n")
-        c.write("void run_model(void){\n")
+        c.write("static void run_from(int first){\n  (void)first;\n")
         def dump_call(node):
             outs=node["outputs"]
             if not outs: return ""
@@ -148,6 +187,7 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
                 nm=node["name"]
                 if not any(sub in nm for sub in dump_nodes): return ""
             o=outs[0]; t=ctx.T.get(o,{}); sh=t.get("shape",[])
+            if t.get("lazy"): return ""      # not stored: made again where it is read
             dt=t.get("dtype","int8"); ref=buf_ref(ctx,o)
             def _numel(dd):
                 n=1
@@ -193,6 +233,10 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
                 return f'  DUMP_FLAT_I8("{node["name"]}", {ref}, {C},{per}, {sc},{zp});\n'
         for _idx,rec in enumerate(ctx.calls):
             node=rec[0]; fn=rec[1]
+            if skip_input and _idx in (1, 2):
+                c.write("  }\n")
+            if skip_input and _idx<2:
+                c.write(f"  if(first<={_idx}){{\n")
             c.write(f'  DBG_NODE({_idx}, "{node["op"]}", "{node["name"]}");\n')
             ins=node["inputs"]; outs=node["outputs"]
             if node["op"]=="QLinearConv":
@@ -200,7 +244,7 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
                 bias=(f"(const int32_t*){wsan(ins[8])}") if len(ins)>8 else "0"
                 y=buf_ref(ctx,outs[0])
                 c.write(f'  TRACE("{node["name"]}");\n  {fn}({x}, {w}, {bias}, {y});\n'); c.write(dump_call(node))
-            elif node["op"]=="SiLU":
+            elif node["op"]=="SiLU" and len(rec)<3:
                 c.write(f'  TRACE("{node["name"]}");\n  {fn}({buf_ref(ctx,ins[0])}, {buf_ref(ctx,outs[0])});\n'); c.write(dump_call(node))
             elif len(rec)>=3:
                 names=rec[2]
@@ -220,13 +264,17 @@ def main(json_path, out_base, target, simd=False, debug=False, dump=False, dump_
                     allt=data_ins+list(outs)
                     exprs=[buf_ref(ctx,t) for t in allt][:len(names)]
                 c.write(f'  TRACE("{node["name"]}");\n  {fn}({", ".join(exprs)});\n'); c.write(dump_call(node))
-        c.write("}\n")
+        c.write("  DBG_END();\n}\n\n")
+        c.write("#ifndef FEMTO_NO_FLOAT_INPUT\nvoid run_model(void){ run_from(0); }\n#endif\n")
+        if skip_input:
+            c.write("void run_model_int8_input(void){ run_from(2); }\n")
 
     n_ok=len(d["nodes"])-sum(skipped.values())
     print(f"codegen[{target}] -> {out_base}.c/.h : {n_ok} ops emitted")
     if skipped:
-        print("  UNHANDLED ops (need emitters/op_*.py):")
-        for op,cnt in sorted(skipped.items()): print(f"    {op}: {cnt}")
+        # C without these ops would compile and give wrong answers: stop instead.
+        raise SystemExit("codegen: no emitter for " + ", ".join(f"{op} x{cnt}" for op,cnt in sorted(skipped.items()))
+                         + " (add one in emitters/op_*.py)")
 
 if __name__=="__main__":
     ap=argparse.ArgumentParser()

@@ -23,7 +23,30 @@ LUT[256] indexed by (uint8)(x+128); each entry = silu(in_scale*(q-128 - in_zp)).
 """
 import math
 from . import register
-from .common import cfloat, fsan, numel
+from .common import cfloat, fsan, numel, quant_c, also_q, also_q_consts, also_q_stores
+
+def _lut_i8_loop(n):
+    """C for y[i] = lut[x[i]] over n int8s: a word of four at a time where both are
+    word-aligned (every arena tensor is), so a quarter of the loads and stores to PSRAM."""
+    return (f"  int i=0;\n"
+            f"  if(!(((uintptr_t)x|(uintptr_t)y)&3)){{ const uint32_t* xw=(const uint32_t*)x; uint32_t* yw=(uint32_t*)y;\n"
+            f"    for(;i+4<={n};i+=4){{ uint32_t v=*xw++ ^ 0x80808080u;\n"
+            f"      *yw++ = (uint32_t)(uint8_t)lut[v&255] | (uint32_t)(uint8_t)lut[(v>>8)&255]<<8\n"
+            f"            | (uint32_t)(uint8_t)lut[(v>>16)&255]<<16 | (uint32_t)(uint8_t)lut[v>>24]<<24; }} }}\n"
+            f"  for(;i<{n};++i) y[i]=lut[(unsigned char)(x[i]+128)];")
+
+def silu_i8_table(is_, iz, os_, oz_):
+    """quantize(silu(dequantize(q))) for the 256 int8 values q, index q+128: the int8
+    SiLU's table, here and in a conv it is folded into (fuse.py fold_silu_into_conv)."""
+    lut=[]
+    for q in range(256):
+        xf=is_*((q-128)-iz)
+        sv=xf/(1.0+math.exp(-xf))               # silu (float)
+        r=int(round(sv/os_))+oz_                 # quantize to int8
+        if r<-128: r=-128
+        if r>127: r=127
+        lut.append(r)
+    return lut
 
 @register("SiLU")
 def emit(ctx, node):
@@ -42,28 +65,43 @@ def emit(ctx, node):
     fused_q = (y_dtype=="int8") and ("out_scale" in a) and ("out_zp" in a)
     os_ = ctx.val0(a["out_scale"]) if fused_q else None
     oz_ = int(ctx.val0(a["out_zp"])) if fused_q else None
-    if (y_dtype=="int8") and not fused_q:
+    late_q = (y_dtype=="int8") and not fused_q and ctx.T[y].get("q_scale") is not None
+    if (y_dtype=="int8") and not fused_q and not late_q:
         raise ValueError(f"SiLU {node['name']}: output marked int8 but out_scale/out_zp missing "
                          f"-- cannot build quant LUT. Check fusion pass.")
 
     h=ctx.header; b=ctx.body
-    if fused_q:
-        # int8 LUT: quantize( silu(dequant(q)) ) baked in. int8 -> int8, quantize is FREE.
-        lut=[]
+    if late_q:
+        # int8 at the scale of the QuantizeLinear that used to follow the layout ops
+        # after it (fuse.py int8_layout_paths): the float table below, quantized on the
+        # first run by that QuantizeLinear's own expression -- the same bytes.
+        lutf=[]
         for q in range(256):
             xf=is_*((q-128)-iz)
-            sv=xf/(1.0+math.exp(-xf))               # silu (float)
-            r=int(round(sv/os_))+oz_                 # quantize to int8
-            if r<-128: r=-128
-            if r>127: r=127
-            lut.append(r)
-        tbl=", ".join(str(v) for v in lut)
+            lutf.append(xf/(1.0+math.exp(-xf)))
+        tbl=", ".join(cfloat(v) for v in lutf)
+        sig=f"void {fn}(const int8_t* x, int8_t* y)"
+        h.append(sig+";")
+        os_l=ctx.T[y]["q_scale"]; oz_l=int(ctx.T[y]["q_zp"])
+        b.append(f"// SiLU {node['name']}  n={n}  in=({is_:.6g},{iz}) out=({os_l:.6g},{oz_l})  int8->int8 (quantized where made)")
+        b.append(sig+" {")
+        b.append(f"  static const float lutf[256]={{{tbl}}};")
+        b.append(f"  static int8_t lut[256]; static int ready=0;")
+        b.append(f"  if(!ready){{ const float inv=1.0f/{cfloat(os_l)}; const int z={oz_l};")
+        b.append(f"    for(int q=0;q<256;++q) " + quant_c("lut[q]", "lutf[q]") + " ready=1; }")
+        b.append(_lut_i8_loop(n))
+        b.append("}"); b.append("")
+        ctx.calls.append((node, fn))
+        return
+    if fused_q:
+        # int8 LUT: quantize( silu(dequant(q)) ) baked in. int8 -> int8, quantize is FREE.
+        tbl=", ".join(str(v) for v in silu_i8_table(is_, iz, os_, oz_))
         sig=f"void {fn}(const int8_t* x, int8_t* y)"
         h.append(sig+";")
         b.append(f"// SiLU {node['name']}  n={n}  in=({is_:.6g},{iz}) out=({os_:.6g},{oz_})  int8->int8 (quant fused)")
         b.append(sig+" {")
         b.append(f"  static const int8_t lut[256]={{{tbl}}};")
-        b.append(f"  for(int i=0;i<{n};++i) y[i]=lut[(unsigned char)(x[i]+128)];")
+        b.append(_lut_i8_loop(n))
         b.append("}"); b.append("")
         if y in ctx.T: ctx.T[y]["dtype"]="int8"
     else:
@@ -73,12 +111,31 @@ def emit(ctx, node):
             xf=is_*((q-128)-iz)
             lutf.append(xf/(1.0+math.exp(-xf)))
         tbl=", ".join(cfloat(v) for v in lutf)
+        extra=also_q(node)
+        if extra:
+            # and the QuantizeLinears after it, in the same pass (fuse.py fold_quantize_into_producer)
+            lazy_y = bool(ctx.T.get(y, {}).get("lazy"))   # floats made again where read: only the int8 here
+            sig=f"void {fn}(const int8_t* x" + ("" if lazy_y else ", float* y") + "".join(f", int8_t* q{k}" for k in range(len(extra))) + ")"
+            h.append(sig+";")
+            b.append(f"// SiLU {node['name']}  n={n}  in=({is_:.6g},{iz})  int8->float, and int8 for {len(extra)} QuantizeLinear(s)")
+            b.append(sig+" {")
+            b.append(f"  static const float lut[256]={{{tbl}}};")
+            b.append("  " + also_q_consts(extra))
+            keep = "" if lazy_y or all(e.get("float_dead") for e in extra) else "y[i]=v; "
+            b.append(f"  for(int i=0;i<{n};++i){{ float v=lut[(unsigned char)(x[i]+128)]; {keep}" + also_q_stores(extra, "v", "i") + " }")
+            b.append("}"); b.append("")
+            if y in ctx.T: ctx.T[y]["dtype"]="float32"
+            ctx.calls.append((node, fn, [x] + ([] if lazy_y else [y]) + [e["dst"] for e in extra]))
+            return
         sig=f"void {fn}(const int8_t* x, float* y)"
         h.append(sig+";")
         b.append(f"// SiLU {node['name']}  n={n}  in=({is_:.6g},{iz})  int8->float")
         b.append(sig+" {")
         b.append(f"  static const float lut[256]={{{tbl}}};")
-        b.append(f"  for(int i=0;i<{n};++i) y[i]=lut[(unsigned char)(x[i]+128)];")
+        b.append(f"  int i=0;")
+        b.append(f"  for(;i+4<={n};i+=4){{ y[i]=lut[(unsigned char)(x[i]+128)]; y[i+1]=lut[(unsigned char)(x[i+1]+128)];")
+        b.append(f"    y[i+2]=lut[(unsigned char)(x[i+2]+128)]; y[i+3]=lut[(unsigned char)(x[i+3]+128)]; }}")
+        b.append(f"  for(;i<{n};++i) y[i]=lut[(unsigned char)(x[i]+128)];")
         b.append("}"); b.append("")
         if y in ctx.T: ctx.T[y]["dtype"]="float32"
     ctx.calls.append((node, fn))

@@ -48,6 +48,11 @@ SRAM_PRIORITY     = "hot"           # "hot" = most-accessed unions first
                                     # "large" = largest unions first
 # --------------------------------------------------------------------------------
 
+# Pack the unions largest tensor first, each where it grows the arena least (step 3).
+# False for first-fit in order of first use, as before October 2026: more memory, the
+# same results (a union only ever holds tensors that are never alive together).
+ARENA_BEST_FIT = True
+
 def san(n): return "tensor_"+"".join(c if c.isalnum() else "_" for c in n)
 
 def sh_of(meta): return meta.get('shape',[])
@@ -60,7 +65,7 @@ def main(json_path, out_h, target="ansi_int8"):
     for idx,n in enumerate(nodes):
         for o in n["outputs"]:
             if o not in defd: defd[o]=idx
-        for i in n["inputs"]:
+        for i in list(n["inputs"])+list(n.get("reads",[])):
             lastuse[i]=idx
     # tensors that are graph outputs live to the end
     end=len(nodes)
@@ -72,6 +77,7 @@ def main(json_path, out_h, target="ansi_int8"):
     for name,meta in T.items():
         if meta.get("const_file"): continue
         if meta["kind"]=="init": continue
+        if meta.get("lazy"): continue             # made again where read (fuse.py mark_lazy_floats)
         if name in persistent: continue
         if name not in defd: continue          # never produced (e.g. pure input) -> skip
         sh=meta["shape"]
@@ -82,18 +88,132 @@ def main(json_path, out_h, target="ansi_int8"):
         cand.append({"name":name,"def":defd[name],"end":lastuse.get(name,defd[name]),
                      "dtype":meta["dtype"],"shape":sh,"bytes":numel*CSZ.get(meta["dtype"],4)})
 
-    # 3) interval-graph greedy coloring: sort by def; assign to first union whose
-    #    tensors' intervals don't overlap this one.
-    cand.sort(key=lambda t:(t["def"], -t["bytes"]))
-    unions=[]                     # each: list of members; and its current 'busy until' per member
-    def overlaps(a,b): return not (a["end"]<b["def"] or b["end"]<a["def"])  # inclusive: in/out of same op conflict
+    # 2b) Views and slabs. An op that only renames its input's bytes (Reshape, Flatten,
+    #     Unsqueeze, Squeeze, a Sigmoid already done in its DequantizeLinears, a
+    #     Transpose whose perm does not fit its rank) gets its output at its input's
+    #     address; a Concat that only copies, along an axis with nothing but 1s before
+    #     it, gets each input written straight into its own slab of the output. Such
+    #     tensors form one group at fixed byte offsets from each other, placed as one
+    #     item live over all their lifetimes; the ops' emitters then skip their copies
+    #     (if(y!=x)). A tensor whose offsets would disagree is left out.
+    by_name={t["name"]:t for t in cand}
+    parent={}                     # name -> (parent, my offset - parent's offset)
+    def find(a):
+        off=0
+        while a in parent:
+            p,o=parent[a]; off+=o; a=p
+        return a,off
+    def link(y,x,o):              # off(y) = off(x) + o
+        ry,oy=find(y); rx,ox=find(x)
+        if ry==rx: return oy==ox+o
+        parent[ry]=(rx, ox+o-oy); return True
+    def is_view(n):
+        op=n["op"]
+        if op in ("Reshape","Flatten","Unsqueeze","Squeeze"): return True
+        if op=="Sigmoid" and n.get("attrs",{}).get("identity"): return True
+        return False
+    def plain_concat(n):
+        """The Concat's emitter only copies (no dequantizing, nothing folded in)."""
+        if n["op"]!="Concat" or n.get("attrs",{}).get("also_q"): return None
+        y=n["outputs"][0]; ys=T.get(y,{}).get("shape") or []
+        ins=n["inputs"]
+        if not ys or len(set(ins))!=len(ins) or y not in by_name: return None
+        ax=n.get("attrs",{}).get("axis",0); ax=ax+len(ys) if ax<0 else ax
+        if not 0<=ax<len(ys) or any(v!=1 for v in ys[:ax]): return None
+        yt=T[y]
+        for i in ins:
+            t=T.get(i,{})
+            if i not in by_name or t.get("dtype")!=yt.get("dtype") or len(t.get("shape") or [])!=len(ys): return None
+            if yt.get("dtype")=="int8":
+                if (t.get("q_scale"),t.get("q_zp"))!=(yt.get("q_scale"),yt.get("q_zp")): return None
+            elif t.get("q_scale") is not None and t.get("dtype")=="int8": return None
+        inner=CSZ.get(yt["dtype"],4)
+        for v in ys[ax+1:]: inner*=v
+        offs=[]; o=0
+        for i in ins:
+            offs.append(o); o+=T[i]["shape"][ax]*inner
+        return list(zip(ins,offs)) if o==by_name[y]["bytes"] else None
+    def view_pair(n):
+        if not (is_view(n) and n["inputs"] and len(n["outputs"])==1): return None
+        x=n["inputs"][0]; y=n["outputs"][0]
+        if x in by_name and y in by_name and by_name[x]["bytes"]==by_name[y]["bytes"] \
+                and CSZ.get(by_name[x]["dtype"],4)==CSZ.get(by_name[y]["dtype"],4):
+            return x,y
+        return None
+    # A tensor and its views hold the same bytes: one "class". A class may be a slab of
+    # one Concat only -- in two, the other parts of both would be put at the same place
+    # (Concat(A,B) and Concat(A,C): B and C both just after A) and overwrite each other.
+    vroot={}
+    def vfind(a):
+        while vroot.get(a,a)!=a: a=vroot[a]
+        return a
+    for n in nodes:
+        pr=view_pair(n)
+        if pr: vroot[vfind(pr[1])]=vfind(pr[0])
+    slab_uses={}
+    for n in nodes:
+        if plain_concat(n):
+            for i in set(vfind(i) for i in n["inputs"]):
+                slab_uses[i]=slab_uses.get(i,0)+1
+    def slab_ok(n):
+        cls=[vfind(i) for i in n["inputs"]]
+        return len(set(cls))==len(cls) and all(slab_uses.get(c,0)==1 for c in cls)
+    views=0; slabs=0
+    for n in nodes:
+        if is_view(n) and n["inputs"] and len(n["outputs"])==1:
+            x=n["inputs"][0]; y=n["outputs"][0]
+            if x in by_name and y in by_name and by_name[x]["bytes"]==by_name[y]["bytes"] \
+                    and CSZ.get(by_name[x]["dtype"],4)==CSZ.get(by_name[y]["dtype"],4):
+                saved=dict(parent)
+                if link(y,x,0): views+=1
+                else: parent.clear(); parent.update(saved)
+            continue
+        parts=plain_concat(n)
+        if parts and slab_ok(n):
+            saved=dict(parent); ok=True
+            for i,o in parts:
+                if not link(i,n["outputs"][0],o): ok=False; break
+            if ok: slabs+=1
+            else: parent.clear(); parent.update(saved)
+    groups={}
     for t in cand:
-        placed=False
-        for u in unions:
-            if all(not overlaps(t,m) for m in u):
-                u.append(t); placed=True; break
-        if not placed:
-            unions.append([t])
+        r,o=find(t["name"]); t["off"]=o; groups.setdefault(r,[]).append(t)
+    for g in groups.values():
+        lo=min(m["off"] for m in g)
+        for m in g: m["off"]-=lo
+    items=[{"def":min(m["def"] for m in g),"end":max(m["end"] for m in g),
+            "bytes":max(m["off"]+m["bytes"] for m in g),"members":g} for g in groups.values()]
+
+    # 3) interval-graph coloring: no two tensors whose lifetimes overlap share a union.
+    #    Best fit (ARENA_BEST_FIT): the largest tensors first, each into the union it
+    #    grows least (of those it fits in by lifetime), so big tensors share unions with
+    #    each other and small ones fill in under them. YOLO26n at 256x256: 3.15 -> 1.76 MB
+    #    of unions. Otherwise, as before: in order of first use, into the first union free.
+    def overlaps(a,b): return not (a["end"]<b["def"] or b["end"]<a["def"])  # inclusive: in/out of same op conflict
+    unions=[]                     # each: the members of its items
+    placed_items=[]               # per union: the items in it
+    if ARENA_BEST_FIT:
+        items.sort(key=lambda t:(-t["bytes"], t["def"], t["end"]))
+        for it in items:
+            best=None
+            for ui in range(len(unions)):
+                if all(not overlaps(it,o) for o in placed_items[ui]):
+                    cur=max(o["bytes"] for o in placed_items[ui])
+                    key=(max(0,it["bytes"]-cur), cur, ui)
+                    if best is None or key<best: best=key
+            if best is None:
+                unions.append(list(it["members"])); placed_items.append([it])
+            else:
+                ui=best[2]; unions[ui].extend(it["members"]); placed_items[ui].append(it)
+    else:
+        items.sort(key=lambda t:(t["def"], -t["bytes"]))
+        for it in items:
+            placed=False
+            for ui,u in enumerate(unions):
+                if all(not overlaps(it,o) for o in placed_items[ui]):
+                    u.extend(it["members"]); placed_items[ui].append(it); placed=True; break
+            if not placed:
+                unions.append(list(it["members"])); placed_items.append([it])
 
     # 3b) Access frequency per tensor = number of nodes that read or write it.
     #     Union access count = sum over its members (members alias but are used at
@@ -102,7 +222,7 @@ def main(json_path, out_h, target="ansi_int8"):
     for n in nodes:
         for nm in list(n["inputs"])+list(n["outputs"]):
             acc_count[nm]=acc_count.get(nm,0)+1
-    def union_size(u): return max(m["bytes"] for m in u)
+    def union_size(u): return max(m["off"]+m["bytes"] for m in u)
     def union_accesses(u): return sum(acc_count.get(m["name"],0) for m in u)
 
     # 3c) Decide SRAM vs PSRAM per union under the budget (greedy, skip-if-too-big).
@@ -140,14 +260,19 @@ def main(json_path, out_h, target="ansi_int8"):
             f.write("#define ARENA_ALLOC_PSRAM(sz) malloc((sz))\n")
             f.write("#define ARENA_FREE(p) free((p))\n\n")
         for ui,u in enumerate(unions):
-            sz=max(m["bytes"] for m in u)
+            sz=union_size(u)
             place="SRAM" if ui in in_sram else "PSRAM"
             f.write(f"union tensor_union_{ui} {{   // {sz} B, {len(u)} tensors, {place}"
                     f" (acc={union_accesses(u)})\n")
             for m in u:
                 ct=CDT.get(m["dtype"],"float")
                 dims="".join(f"[{x}]" for x in m["shape"]) if m["shape"] else "[1]"
+                if m["off"]:              # a slab of another tensor: reached by its offset
+                    f.write(f"    // {ct} {san(m['name'])}{dims} at +{m['off']}; // {m['bytes']} B  live[{m['def']},{m['end']}]\n")
+                    continue
                 f.write(f"    {ct} {san(m['name'])}{dims}; // {m['bytes']} B  live[{m['def']},{m['end']}]\n")
+            if any(m["off"] for m in u):
+                f.write(f"    unsigned char whole_[{sz}];\n")
             f.write(f"}};\nextern union tensor_union_{ui} *tu{ui};\n\n")
 
         # Split remaining tensors into: LIVE (produced or graph input/output) vs
@@ -184,7 +309,7 @@ def main(json_path, out_h, target="ansi_int8"):
         live=[]; dead={"fusion":[], "transpose":[], "unused":[]}
         for name,meta in T.items():
             if meta.get("const_file") or meta["kind"]=="init": continue
-            if name in done: continue
+            if name in done or meta.get("lazy"): continue
             sh=meta["shape"]
             if any((not isinstance(x,int)) or x<0 for x in sh): continue
             if name in produced or name in graph_io:
@@ -195,7 +320,7 @@ def main(json_path, out_h, target="ansi_int8"):
         f.write("// persistent / standalone buffers (live: produced or graph I/O)\n")
         # On esp32s3 these can be large (e.g. the [3087][85] output) -> put them in
         # PSRAM via pointers too, else they overflow internal DRAM .bss.
-        standalone=[]
+        standalone=[]; ansi_bufs=[]
         for name,meta in live:
             ctype=CDT.get(meta["dtype"],"float")
             dims="".join(f"[{x}]" for x in meta["shape"]) if meta["shape"] else "[1]"
@@ -208,7 +333,11 @@ def main(json_path, out_h, target="ansi_int8"):
                 f.write(f"extern {ctype} (*{san(name)}_p){inner if inner else '[1]'}; // {nbytes} B PSRAM\n")
                 standalone.append((name,meta,ctype,inner,nbytes))
             else:
-                f.write(f"static {ctype} {san(name)}{dims};\n")
+                # extern, defined once in activations.c: a static here gave every file
+                # that includes this header its own copy, so the caller filled an input
+                # and read an output the model never saw
+                f.write(f"extern {ctype} {san(name)}{dims};\n")
+                ansi_bufs.append((ctype,san(name),dims))
         # access macros for esp32s3 standalone pointers: tensor_x -> (*tensor_x_p)
         for name,meta,ctype,inner,nbytes in standalone:
             if inner:
@@ -236,7 +365,12 @@ def main(json_path, out_h, target="ansi_int8"):
         f.write("\n// access macros -> tuN->member (real typed arrays)\n")
         for ui,u in enumerate(unions):
             for m in u:
-                f.write(f"#define {san(m['name'])} (tu{ui}->{san(m['name'])})\n")
+                if m["off"]:
+                    ct=CDT.get(m["dtype"],"float")
+                    dims="".join(f"[{x}]" for x in m["shape"]) if m["shape"] else "[1]"
+                    f.write(f"#define {san(m['name'])} (*({ct}(*){dims})((unsigned char*)tu{ui}+{m['off']}))\n")
+                else:
+                    f.write(f"#define {san(m['name'])} (tu{ui}->{san(m['name'])})\n")
         # init / free
         # DECLARATIONS ONLY in the header (definitions go to activations.c, compiled once)
         f.write("\nint activations_init(void);\nvoid activations_free(void);\n")
@@ -256,6 +390,8 @@ def main(json_path, out_h, target="ansi_int8"):
                 g.write(f"union tensor_union_{ui} *tu{ui} = 0;\n")
             for (name,meta,ctype,inner,nbytes) in _standalone:
                 g.write(f"{ctype} (*{san(name)}_p){inner if inner else '[1]'} = 0;\n")
+            for (ctype,nm,dims) in ansi_bufs:
+                g.write(f"{ctype} {nm}{dims};\n")
             g.write("\n")
             g.write("int activations_init(void){\n")
             for ui in range(len(unions)):
@@ -269,7 +405,12 @@ def main(json_path, out_h, target="ansi_int8"):
             for j,(name,meta,ctype,inner,nbytes) in enumerate(_standalone):
                 cast=f"({ctype}(*){inner if inner else '[1]'})"
                 # standalone buffers (often large, e.g. output) -> PSRAM
+                # The float input is not needed by a caller that writes the int8 input itself
+                # (run_model_int8_input): with FEMTO_NO_FLOAT_INPUT defined it is not taken.
+                float_input = name in d["inputs"] and ctype=="float"
+                if float_input: g.write("#ifndef FEMTO_NO_FLOAT_INPUT\n")
                 g.write(f"  {san(name)}_p={cast}ARENA_ALLOC_PSRAM({nbytes}); if(!{san(name)}_p) return {base+j+1};\n")
+                if float_input: g.write("#endif\n")
             g.write("  return 0;\n}\n")
             g.write("void activations_free(void){\n")
             for ui in range(len(unions)):
@@ -285,9 +426,9 @@ def main(json_path, out_h, target="ansi_int8"):
     print(f"[arena] unions={len(unions)}  SRAM={_ns} ({_used} B / {SRAM_BUDGET_BYTES} B budget, "
           f"{SRAM_PRIORITY})  PSRAM={_nps}")
 
-    total=sum(max(m['bytes'] for m in u) for u in unions)
+    total=sum(union_size(u) for u in unions)
     naive=sum(m['bytes'] for u in unions for m in u)
-    print(f"gen_activations -> {out_h}: {len(unions)} unions, {len(cand)} tensors")
+    print(f"gen_activations -> {out_h}: {len(unions)} unions, {len(cand)} tensors, {views} views and {slabs} concats share their inputs' memory")
     print(f"  arena bytes (unioned) = {total}   vs naive = {naive}   saved {100*(1-total/max(naive,1)):.0f}%")
 
 if __name__=="__main__":

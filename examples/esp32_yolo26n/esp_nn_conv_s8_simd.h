@@ -5,10 +5,11 @@
  * NHWC layout, TFLite-Micro compatible quantization.
  *
  * Paths selected automatically at runtime:
- *   1. 1x1 / stride 1 / no pad  -> transpose + QACC parallel MAC (8 pixels at once)
- *   2. Everything else           -> im2col + ACCX SIMD dot product
- *                                   (handles padding, any stride, any filter size)
- *   3. Non-S3 targets            -> plain C fallback (bit-exact same results)
+ *   1. Every plain conv on the S3 -> im2col + ACCX SIMD dot product, in blocks of
+ *                                    output channels whose filters fit in the fast
+ *                                    buffer (1x1, padding, any stride, any filter
+ *                                    size), on one core or two
+ *   2. Grouped convs, non-S3      -> plain C fallback (bit-exact same results)
  *
  * ---------------------------------------------------------------------------
  * USAGE
@@ -29,11 +30,12 @@
  *   };
  *   quant_data_t quant = { .shift = per_ch_shift, .mult = per_ch_mult };
  *
- *   // 1) (optional but recommended) give the library a scratch buffer.
- *   //    If you skip this, it mallocs/caches one internally.
- *   int need = esp_nn_conv_s8_simd_get_scratch_size(&in_dims, &filt_dims,
- *                                                   &out_dims, &params);
- *   esp_nn_conv_s8_simd_set_scratch_buf(my_buffer, my_buffer_size);
+ *   // 1) (optional) give the library its fast buffer: internal SRAM, 8-48 KB.
+ *   //    Each conv runs in blocks of output channels whose filters fit in it
+ *   //    (see "Fast buffer" in the .c). If you skip this, the first conv takes
+ *   //    the largest of 32/24/16/8 KB of internal SRAM it can get, or 16 KB of
+ *   //    PSRAM -- without regard to what wifi or TLS will need later.
+ *   esp_nn_conv_s8_simd_set_fast_buf(my_sram_buffer, my_sram_buffer_size);
  *
  *   // 2) run the convolution
  *   esp_nn_conv_s8_simd(&in_dims, input, &filt_dims, filter, bias,
@@ -106,18 +108,63 @@ typedef struct {
 #endif /* ESP_NN_SIMD_USE_ESP_NN_DEFS */
 
 /**
- * Scratch bytes required for the given conv shape (worst case for the path
- * that will actually be chosen). Returns 0 if no scratch is needed.
+ * Give the S3 paths their fast buffer (internal SRAM; any alignment). Pass NULL,0
+ * to let the library take its own on the next conv.
+ */
+void esp_nn_conv_s8_simd_set_fast_buf(void *buf, int size_bytes);
+
+/** Bytes of fast buffer in use; 0 before the first conv if none was given. */
+int esp_nn_conv_s8_simd_fast_size(void);
+
+/**
+ * 2: run each conv on both cores, a worker on the other core taking half of the
+ * output rows (created on the first call, pinned to the core this is not called
+ * from, at the caller's priority). 1: this core only (the default). Call it from
+ * the task that runs the model. Returns the number of cores now in use.
+ */
+int esp_nn_conv_s8_simd_set_cores(int cores);
+
+/** The number of cores the convs run on now: 1, or 2 after set_cores(2). */
+int esp_nn_conv_s8_simd_cores(void);
+
+/**
+ * A 256-byte table every output of the following convs and depthwise convs goes
+ * through as it is stored: the int8 result r is stored as lut[r + 128] (an
+ * activation such as SiLU folded into the conv, so its own pass over the output is
+ * not needed). NULL (the default) for none. Set it just before the call and clear it
+ * just after; the table must outlive the call.
+ */
+void esp_nn_conv_s8_simd_set_out_lut(const int8_t *lut);
+
+/** The table set above, or NULL. */
+const int8_t *esp_nn_simd_out_lut(void);
+
+/** The table over n output bytes already stored (no-op without one). */
+void esp_nn_simd_apply_out_lut(int8_t *out, size_t n);
+
+/**
+ * The fast buffer itself, taken now if no conv has taken it yet (NULL if none can
+ * be had), and its size in *size. For another kernel run from the same task
+ * between convs -- the depthwise conv borrows it for its rows -- never during one.
+ */
+void *esp_nn_conv_s8_simd_borrow_fast_buf(int *size);
+
+/**
+ * With esp_nn_conv_s8_simd_set_cores(2): fn(theirs) on the worker on the other
+ * core while fn(mine) runs here; returns 1 once both are done. Returns 0, having
+ * run nothing, on one core. For kernels that split their rows like the convs.
+ */
+int esp_nn_simd_both_cores(void (*fn)(void *), void *mine, void *theirs);
+
+/**
+ * Kept for the old API: always 0 now, as the S3 paths need only the fast buffer.
  */
 int esp_nn_conv_s8_simd_get_scratch_size(const data_dims_t *input_dims,
                                          const data_dims_t *filter_dims,
                                          const data_dims_t *output_dims,
                                          const conv_params_t *conv_params);
 
-/**
- * Provide a user-owned scratch buffer (any alignment; aligned internally).
- * Pass NULL,0 to revert to internal malloc'd scratch.
- */
+/** Kept for the old API: the same as esp_nn_conv_s8_simd_set_fast_buf(). */
 void esp_nn_conv_s8_simd_set_scratch_buf(void *buf, int size_bytes);
 
 /**
@@ -148,7 +195,7 @@ void esp_nn_conv_s8_ref(const data_dims_t *input_dims,
                         const quant_data_t *quant_data);
 
 /** Name of the path chosen by the last esp_nn_conv_s8_simd() call
- *  ("1x1_simd", "im2col_simd", "c_ref"). Handy for benchmarks. */
+ *  ("im2col_simd", "im2col_simd_2core", "c_ref"). Handy for benchmarks. */
 const char *esp_nn_conv_s8_simd_last_path(void);
 
 #ifdef __cplusplus
